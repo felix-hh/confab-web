@@ -17,7 +17,6 @@ import (
 )
 
 // mockAnthropicResponse returns a valid Anthropic API response with a smart recap JSON.
-// The text content omits the leading "{" because the analyzer prefills it.
 func mockAnthropicResponse() anthropic.MessagesResponse {
 	return anthropic.MessagesResponse{
 		ID:         "msg_test",
@@ -27,7 +26,7 @@ func mockAnthropicResponse() anthropic.MessagesResponse {
 		Content: []anthropic.ContentBlock{
 			{
 				Type: "text",
-				Text: `"suggested_session_title": "Test Session", "recap": "Test recap content.", "went_well": ["Good thing"], "went_bad": [], "human_suggestions": [], "environment_suggestions": [], "default_context_suggestions": []}`,
+				Text: `{"suggested_session_title": "Test Session", "recap": "Test recap content.", "went_well": ["Good thing"], "went_bad": [], "human_suggestions": [], "environment_suggestions": [], "default_context_suggestions": []}`,
 			},
 		},
 		Usage: anthropic.Usage{

@@ -719,7 +719,7 @@ func TestSmartRecap_CacheMissTriggersGeneration(t *testing.T) {
 			Content: []anthropic.ContentBlock{
 				{
 					Type: "text",
-					Text: `"suggested_session_title": "Generated Title", "recap": "Generated recap.", "went_well": ["Good"], "went_bad": [], "human_suggestions": [], "environment_suggestions": [], "default_context_suggestions": []}`,
+					Text: `{"suggested_session_title": "Generated Title", "recap": "Generated recap.", "went_well": ["Good"], "went_bad": [], "human_suggestions": [], "environment_suggestions": [], "default_context_suggestions": []}`,
 				},
 			},
 			Usage: anthropic.Usage{
