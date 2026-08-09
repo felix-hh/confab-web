@@ -50,7 +50,18 @@ type Worker struct {
 	precomputer   precomputerAPI
 	config        WorkerConfig
 	pricingSource *pricingsource.Source // refreshes the active price table each cycle
+
+	// recapFailures counts consecutive smart-recap failures per session ID.
+	// Sessions at or above maxRecapFailures are skipped: a failed generation
+	// writes nothing, so the session stays "stale" forever and would otherwise
+	// be retried with a full-transcript LLM call on every sweep. In-memory by
+	// design — a worker restart grants every session a fresh set of attempts.
+	recapFailures map[string]int
 }
+
+// maxRecapFailures is the number of consecutive failures after which a
+// session's smart recap is no longer attempted (until the worker restarts).
+const maxRecapFailures = 3
 
 // runWorker is the entry point for the background worker process.
 func runWorker() {
@@ -120,6 +131,7 @@ func runWorker() {
 		precomputer:   precomputer,
 		config:        workerConfig,
 		pricingSource: pricingsource.NewFromEnv(os.Getenv("ENABLE_SAAS_FOOTER") == "true"),
+		recapFailures: make(map[string]int),
 	}
 
 	// Setup graceful shutdown
@@ -313,8 +325,32 @@ func (w *Worker) processRegularSessions(ctx context.Context, sessions []analytic
 }
 
 // processSmartRecapSessions processes sessions with only stale smart recap.
+// Sessions that have failed maxRecapFailures times in a row are skipped so a
+// deterministic failure can't burn an LLM call every sweep forever.
 func (w *Worker) processSmartRecapSessions(ctx context.Context, sessions []analytics.StaleSession) (processed, errors int) {
-	return w.processSessions(ctx, sessions, "smart recap", w.precomputer.PrecomputeSmartRecapOnly, 500*time.Millisecond)
+	eligible := make([]analytics.StaleSession, 0, len(sessions))
+	for _, s := range sessions {
+		if w.recapFailures[s.SessionID] >= maxRecapFailures {
+			logger.Warn("skipping smart recap: too many consecutive failures",
+				"session_id", s.SessionID,
+				"external_id", s.ExternalID,
+				"failures", w.recapFailures[s.SessionID],
+			)
+			continue
+		}
+		eligible = append(eligible, s)
+	}
+	return w.processSessions(ctx, eligible, "smart recap", func(ctx context.Context, s analytics.StaleSession) error {
+		err := w.precomputer.PrecomputeSmartRecapOnly(ctx, s)
+		if err == nil {
+			delete(w.recapFailures, s.SessionID)
+		} else if err != analytics.ErrQuotaExceeded && ctx.Err() == nil {
+			// Count only real generation failures — not quota skips, and not
+			// context cancellation from a shutdown mid-request.
+			w.recapFailures[s.SessionID]++
+		}
+		return err
+	}, 500*time.Millisecond)
 }
 
 // processSearchIndexSessions processes sessions with stale search index.

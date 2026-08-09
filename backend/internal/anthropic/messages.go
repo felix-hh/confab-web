@@ -1,14 +1,31 @@
 package anthropic
 
-import "fmt"
+import (
+	"encoding/json"
+	"fmt"
+)
 
 // MessagesRequest represents a request to the Messages API.
 type MessagesRequest struct {
-	Model       string    `json:"model"`
-	MaxTokens   int       `json:"max_tokens"`
-	Temperature *float64  `json:"temperature,omitempty"`
-	System      string    `json:"system,omitempty"`
-	Messages    []Message `json:"messages"`
+	Model        string        `json:"model"`
+	MaxTokens    int           `json:"max_tokens"`
+	Temperature  *float64      `json:"temperature,omitempty"`
+	System       string        `json:"system,omitempty"`
+	Messages     []Message     `json:"messages"`
+	OutputConfig *OutputConfig `json:"output_config,omitempty"`
+}
+
+// OutputConfig constrains the response format (structured outputs).
+type OutputConfig struct {
+	Format *OutputFormat `json:"format,omitempty"`
+}
+
+// OutputFormat specifies a JSON schema the response must conform to.
+// Type is always "json_schema". Schema must be a valid JSON Schema object
+// with additionalProperties: false on every object.
+type OutputFormat struct {
+	Type   string          `json:"type"`
+	Schema json.RawMessage `json:"schema"`
 }
 
 // Message represents a conversation message.

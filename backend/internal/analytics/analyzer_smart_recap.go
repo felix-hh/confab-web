@@ -17,7 +17,9 @@ import (
 
 const (
 	// DefaultMaxOutputTokens is the default maximum number of output tokens for the recap.
-	DefaultMaxOutputTokens = 1000
+	// Recaps for long sessions routinely exceed 1000 tokens; a tight cap silently
+	// truncates the JSON mid-generation and the parse fails on every retry.
+	DefaultMaxOutputTokens = 4000
 
 	// DefaultMaxTranscriptTokens is the default approximate maximum input size (characters / 4 as rough estimate).
 	DefaultMaxTranscriptTokens = 50000
@@ -79,6 +81,40 @@ type SmartRecapResult struct {
 	OutputTokens     int
 	GenerationTimeMs int
 }
+
+// smartRecapSchema is the JSON schema enforced via structured outputs
+// (output_config.format). It guarantees the response is a single valid JSON
+// object matching SmartRecapResult — no preamble, no trailing commentary, no
+// malformed JSON. Must stay in sync with SmartRecapResult and the FIXED
+// output-format section of the system prompt.
+const smartRecapSchema = `{
+	"type": "object",
+	"properties": {
+		"suggested_session_title": {"type": "string"},
+		"recap": {"type": "string"},
+		"went_well": {"$ref": "#/$defs/items"},
+		"went_bad": {"$ref": "#/$defs/items"},
+		"human_suggestions": {"$ref": "#/$defs/items"},
+		"environment_suggestions": {"$ref": "#/$defs/items"},
+		"default_context_suggestions": {"$ref": "#/$defs/items"}
+	},
+	"required": ["suggested_session_title", "recap", "went_well", "went_bad", "human_suggestions", "environment_suggestions", "default_context_suggestions"],
+	"additionalProperties": false,
+	"$defs": {
+		"items": {
+			"type": "array",
+			"items": {
+				"type": "object",
+				"properties": {
+					"text": {"type": "string"},
+					"message_id": {"type": "integer"}
+				},
+				"required": ["text", "message_id"],
+				"additionalProperties": false
+			}
+		}
+	}
+}`
 
 // SmartRecapAnalyzer generates AI-powered session recaps using Claude Haiku.
 type SmartRecapAnalyzer struct {
@@ -173,9 +209,15 @@ func (a *SmartRecapAnalyzer) Analyze(ctx context.Context, input GenerateInput, c
 	start := time.Now()
 
 	resp, err := a.client.CreateMessage(ctx, &anthropic.MessagesRequest{
-		Model:       a.model,
-		MaxTokens:   a.maxOutputTokens,
-		System:      a.systemPrompt,
+		Model:     a.model,
+		MaxTokens: a.maxOutputTokens,
+		System:    a.systemPrompt,
+		OutputConfig: &anthropic.OutputConfig{
+			Format: &anthropic.OutputFormat{
+				Type:   "json_schema",
+				Schema: []byte(smartRecapSchema),
+			},
+		},
 		Messages: []anthropic.Message{
 			{Role: "user", Content: userContent},
 		},
