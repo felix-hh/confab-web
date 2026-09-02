@@ -872,6 +872,21 @@ func (p *Precomputer) PrecomputeSmartRecapOnly(ctx context.Context, session Stal
 		return nil
 	}
 
+	// Check quota before sp.Parse, which downloads every chunk from object
+	// storage; a quota-skipped session stays stale and would re-download each poll.
+	if session.RegenRequestedAt == nil && p.config.SmartRecapQuota > 0 {
+		count, err := recapquota.GetCount(ctx, p.db, session.UserID)
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+			return err
+		}
+		if count >= p.config.SmartRecapQuota {
+			span.SetAttributes(attribute.Bool("smart_recap.skipped", true), attribute.String("reason", "quota_exceeded"))
+			return ErrQuotaExceeded
+		}
+	}
+
 	rollout, err := sp.Parse(ctx, p.parseInput(session))
 	if err != nil {
 		span.RecordError(err)
