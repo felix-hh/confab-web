@@ -30,6 +30,7 @@ Custom React hooks for the Confab frontend. Organized by responsibility: data fe
 | `useTheme.ts` | Theme state (light/dark) with toggle |
 | `useDocumentTitle.ts` | Sets document title with "| Confabulous" suffix |
 | `useCopyToClipboard.ts` | Clipboard copy with success feedback timer |
+| `useOpenOnRisingEdge.ts` | Controlled `<details>` open state that auto-opens on the rising edge of a boolean trigger (e.g. active search match) and stays user-toggleable. Shared by `UnknownRawDetails`, Claude's `UnknownRawJson`, and `SubagentCard`. Imported by path (not in the barrel) |
 | `useSuccessMessage.ts` | Auto-dismissing success messages (optional URL param support) |
 | `useDropdown.ts` | Dropdown state with click-outside and Escape key handling |
 | `useVisibility.ts` | Tracks document/tab visibility via `visibilitychange` |
@@ -71,6 +72,7 @@ Custom React hooks for the Confab frontend. Organized by responsibility: data fe
 | `useSuccessMessage` | `(options?) => UseSuccessMessageReturn` | Auto-fading success message with optional URL param extraction. |
 | `useCopyToClipboard` | `(options?) => UseCopyToClipboardReturn` | Clipboard write with configurable success duration. |
 | `useAutoRetry` | `(retryFn, options) => UseAutoRetryReturn` | Exponential backoff with countdown display and exhaustion tracking. |
+| `useOpenOnRisingEdge` | `(trigger: boolean) => [open, setOpen]` | Opens when `trigger` goes false → true (same render, "adjust state while rendering"); never force-closes, so the user can collapse it again. |
 
 ### Browser / Context
 
@@ -108,6 +110,8 @@ const { data, state, refetch, loading, error } = useSmartPolling(fetchFn, {
 - Filter state is URL-synced via `useSearchParams` -- refreshing the page preserves filters
 - Polling hooks respect tab visibility: no network requests when the tab is hidden
 - `useSmartPolling` uses refs extensively to avoid stale closures in timeouts
+- Refs are never read or written during render (enforced by `eslint-plugin-react-hooks` 7.1+): latest-value refs (`fetchFnRef`, `configRef`, `scheduleNextRef`) are assigned in `useLayoutEffect`, so callbacks and effects see the committed value
+- State that must reset when an input changes (`useLoadSession` deps, `useAutoRetry` `enabled`) uses React's "adjust state while rendering" pattern — the previous input is held in `useState` and compared during render — rather than a ref or a synchronous `setState` in an effect
 
 ## Design Decisions
 
@@ -119,7 +123,6 @@ const { data, state, refetch, loading, error } = useSmartPolling(fetchFn, {
 
 Most hooks have co-located test files:
 - `useAuth.test.tsx`, `useAutoRetry.test.ts`, `useDropdown.test.ts`
-- `useColumnCount.test.tsx`
 - `useLoadSession.test.ts`, `useSessionFilters.test.ts`, `useSessionsFetch.test.ts`
 - `useOrgAnalytics.test.tsx`
 - `useShareDialog.test.ts`, `useSmartPolling.test.ts`

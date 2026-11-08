@@ -17,6 +17,7 @@ with Storybook.
 | `config/` | App configuration constants (polling intervals) | Changing polling behavior, adding feature flags |
 | `contexts/` | React contexts: ThemeContext, AppConfigContext, KeyboardShortcutContext | Adding app-wide state, changing context providers |
 | `hooks/` | Custom React hooks: data fetching, polling, auth, UI state | Adding data-fetching logic, changing state management |
+| `legal/` | The SaaS legal documents as Markdown (`terms`, `privacy`, `cookies`, `disclaimer`, `acceptable-use`), the `docs.ts` registry (slug, title, description, `lastUpdated`) and `content.ts` (Markdown map, lazy-loaded). See `legal/README.md` | Editing a policy; adding a cookie or storage key (update `cookies.md`); adding a policy |
 | `pages/` | Route-level page components (SessionsPage, TrendsPage, LoginPage, etc.) | Adding new pages/routes, changing page layout |
 | `providers/` | Per-provider transcript adapters: `ProviderAdapter` interface, `getAdapter()` registry, `useTranscriptData` shared hooks, per-provider `calculateMessageCost` / `extendCostTooltip` (CF-418). SessionViewer dispatches through this layer instead of branching on `session.provider` (CF-417) | Adding a new provider's transcript pipeline; changing how SessionViewer fetches / filters / renders per provider |
 | `schemas/` | Zod schemas for API response validation and transcript parsing | Changing API contracts, adding new response types |
@@ -116,6 +117,12 @@ components/     →  renders typed SessionDetail
 - Every component uses a co-located `.module.css` file for scoped styles.
 - Colors and spacing use CSS custom properties from `styles/variables.css`.
 - The `[data-theme="dark"]` selector drives dark mode. Never hardcode colors.
+
+### Browser storage and third-party requests
+
+- The app keeps only strictly-necessary client storage: `localStorage['confab-theme']` (`index.html`, `contexts/ThemeContext.tsx`), `localStorage['quickstart-cta-dismissed']` (`components/QuickstartCTA.tsx`) and `sessionStorage['chunk_reload_attempted:<path>']` (`components/ErrorBoundary.tsx`). That, plus the auth-only cookies in `backend/internal/auth`, is why there is no consent banner (5z5r).
+- Adding or changing a storage key means updating the Cookie Policy (`frontend/src/legal/cookies.md`).
+- Nothing loads from a third-party origin at page load. The Lobster wordmark font is self-hosted via `@fontsource/lobster` (imported in `main.tsx` and `.storybook/preview.tsx`), and the CSP in `backend/internal/api/server.go` allows only `'self'` for fonts and styles. Don't add CDN fonts, scripts or trackers without revisiting the policies and the CSP.
 
 ### Storybook
 

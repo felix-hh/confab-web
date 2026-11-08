@@ -1,9 +1,9 @@
 package analytics
 
 import (
-	"bufio"
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"time"
 )
 
@@ -14,9 +14,14 @@ type TranscriptFile struct {
 	ValidationErrors []LineValidationError
 	TotalLines       int // Total lines processed (including invalid ones)
 
+	// RedactionCounts holds [REDACTED:TYPE] marker counts (type -> count)
+	// across this file's valid lines, computed at parse time so parsed lines
+	// need not retain a generic copy of their JSON. Nil when the file has none.
+	RedactionCounts map[string]int
+
 	// Cached result of AssistantMessageGroups (computed on first call)
-	cachedGroups    []AssistantMessageGroup
-	groupsComputed  bool
+	cachedGroups   []AssistantMessageGroup
+	groupsComputed bool
 }
 
 // FileCollection contains all transcript data for a session.
@@ -109,28 +114,46 @@ func (fc *FileCollection) ValidationErrorCount() int {
 	return count
 }
 
+// maxLineBytes is the longest transcript line parseTranscriptFile decodes; a
+// longer line is skipped as a LineValidationError instead of aborting the
+// parse. The cap sits above the 16 MB upload body bound (api.MaxBodyXL) on
+// purpose: it never drops uploaded data and only guards inputs that came
+// another way.
+const maxLineBytes = 32 * 1024 * 1024
+
 // parseTranscriptFile parses raw JSONL content into a TranscriptFile.
-// It validates each line and collects validation errors.
+// It validates each line and collects validation errors. A malformed or
+// oversized line never fails the file; the error return is always nil.
 func parseTranscriptFile(content []byte, agentID string) (*TranscriptFile, error) {
 	var lines []*TranscriptLine
 	var validationErrors []LineValidationError
+	var redactionCounts map[string]int
 	lineNumber := 0
 
-	scanner := bufio.NewScanner(bytes.NewReader(content))
-	// Increase buffer size for large lines (some assistant messages can be huge)
-	const maxLineSize = 10 * 1024 * 1024 // 10MB
-	buf := make([]byte, 0, 64*1024)
-	scanner.Buffer(buf, maxLineSize)
-
-	for scanner.Scan() {
+	for lineData := range bytes.Lines(content) {
 		lineNumber++
-		lineData := scanner.Bytes()
+		// Drop "\n" then one "\r", as bufio.ScanLines does.
+		lineData = bytes.TrimSuffix(bytes.TrimSuffix(lineData, []byte("\n")), []byte("\r"))
 		if len(bytes.TrimSpace(lineData)) == 0 {
 			continue
 		}
 
+		if len(lineData) > maxLineBytes {
+			// RawJSON slices before converting: same result as truncating
+			// the whole line, without copying it into a string.
+			validationErrors = append(validationErrors, LineValidationError{
+				Line:    lineNumber,
+				RawJSON: truncateJSON(string(lineData[:201]), 200),
+				Errors: []ValidationError{{
+					Path:    "(root)",
+					Message: fmt.Sprintf("line exceeds %d MiB cap (%d bytes); skipped", maxLineBytes>>20, len(lineData)),
+				}},
+			})
+			continue
+		}
+
 		// First, parse into a raw map for validation
-		var rawMap map[string]interface{}
+		var rawMap map[string]any
 		if err := json.Unmarshal(lineData, &rawMap); err != nil {
 			// JSON parse error - add as validation error
 			validationErrors = append(validationErrors, LineValidationError{
@@ -173,10 +196,9 @@ func parseTranscriptFile(content []byte, agentID string) (*TranscriptFile, error
 		}
 
 		lines = append(lines, line)
-	}
-
-	if err := scanner.Err(); err != nil {
-		return nil, err
+		// Count redaction markers from the validation map while it is still
+		// live, so no generic copy of the line outlives this iteration.
+		countRedactionsInValue(rawMap, &redactionCounts)
 	}
 
 	return &TranscriptFile{
@@ -184,6 +206,7 @@ func parseTranscriptFile(content []byte, agentID string) (*TranscriptFile, error
 		AgentID:          agentID,
 		ValidationErrors: validationErrors,
 		TotalLines:       lineNumber,
+		RedactionCounts:  redactionCounts,
 	}, nil
 }
 
@@ -206,13 +229,13 @@ func (tf *TranscriptFile) BuildTimestampMap() map[string]time.Time {
 // and the same message.id can reappear later via context replay.
 // This struct merges all occurrences into a single logical response.
 type AssistantMessageGroup struct {
-	MessageID  string      // API message ID (empty for lines without one)
-	FinalUsage *TokenUsage // Usage from the last occurrence (final output_tokens)
-	Model      string      // Model from the first occurrence
-	HasText    bool        // True if ANY line in the group has text content
-	HasToolUse bool        // True if ANY line in the group has tool_use
-	HasThinking bool       // True if ANY line in the group has thinking
-	IsFastMode bool        // True if any line has speed="fast"
+	MessageID   string      // API message ID (empty for lines without one)
+	FinalUsage  *TokenUsage // Usage from the last occurrence (final output_tokens)
+	Model       string      // Model from the first occurrence
+	HasText     bool        // True if ANY line in the group has text content
+	HasToolUse  bool        // True if ANY line in the group has tool_use
+	HasThinking bool        // True if ANY line in the group has thinking
+	IsFastMode  bool        // True if any line has speed="fast"
 }
 
 // AssistantMessageGroups groups assistant lines by message.id and returns

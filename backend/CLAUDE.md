@@ -27,6 +27,10 @@ Sharded (parallel package-at-a-time, what CI runs):
 
 Integration tests use `testutil.SetupTestEnvironment(t)` for a containerized Postgres + MinIO.
 
+## Formatting
+
+CI runs `make fmt-check` (gofmt + `go fix -diff`) in the `backend-unit` job. Run `make fmt` before pushing. When bumping the Go version (`go.mod` + `ci.yml` together), also run `make fmt`: new toolchains add modernizers that the gate will flag.
+
 ## Code intelligence (Go LSP)
 
 If the Go LSP is available, use it when it helps — go-to-definition, find-references, and hover types beat grep for cross-file symbol and type work. Skip it when a plain read or grep is quicker.
@@ -46,7 +50,7 @@ This rule exists because Go's `database/sql` silently allows Scan over a subset 
 
 Prices live in **one** place: `internal/pricingsource/pricing.json` (provider-nested, embedded via `go:embed`). To add or reprice a model, edit that file and bump its `updated_at`. There is no second table to keep in sync — the backend cost compute and the frontend both read from it.
 
-The backend serves the effective table at `GET /api/v1/pricing` and refreshes it from confabulous.dev at runtime, so self-hosters pick up new prices without a redeploy (see `internal/pricingsource/README.md`). Read `internal/analytics/README.md` before adding an OpenAI entry — its billing conventions (cached_input as subset, reasoning_output as subset, free cache writes) differ from Anthropic's.
+The backend serves the effective table at `GET /api/v1/pricing` and refreshes it from confabulous.dev at runtime, so self-hosters pick up new prices without a redeploy (see `internal/pricingsource/README.md`). Read `internal/analytics/README.md` before adding an OpenAI entry — its billing conventions (cached_input as subset, reasoning_output as subset) differ from Anthropic's. Cache writes are not free across the board: the 5.6 and 6 families bill them at 1.25x short-context input, while older families publish no price and stay at 0. They cost nothing today only because the Codex wire carries no cache-write token count (`md0z`).
 
 Anthropic prices: https://www.anthropic.com/pricing
 OpenAI prices: https://developers.openai.com/api/docs/pricing

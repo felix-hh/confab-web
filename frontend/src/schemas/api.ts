@@ -349,6 +349,8 @@ const SmartRecapCardDataSchema = z.object({
   default_context_suggestions: z.array(AnnotatedItemSchema),
   computed_at: z.string(),
   model_used: z.string(),
+  // LLM vendor that generated the recap (legacy cards are reported as anthropic by the backend)
+  llm_provider: z.enum(['anthropic', 'openai']),
 });
 
 // Quota information for smart recap generation
@@ -591,7 +593,7 @@ const TrendsCardsSchema = z.object({
 // Mirrors SessionFilterOptions: lists reflect the caller's visible-session set
 // and are STATIC across active filter changes. Always present; empty arrays
 // when nothing is visible.
-export const TrendsFilterOptionsSchema = z.object({
+const TrendsFilterOptionsSchema = z.object({
   owners: z.array(z.string()),
   repos: z.array(z.string()),
   // 2hh1: distinct normalized model-family keys (family + '· fast' variants)
@@ -652,7 +654,6 @@ export type SmartRecapQuotaInfo = z.infer<typeof SmartRecapQuotaInfoSchema>;
 export type AnalyticsCards = z.infer<typeof AnalyticsCardsSchema>;
 export type SessionAnalytics = z.infer<typeof SessionAnalyticsSchema>;
 export type TrendsResponse = z.infer<typeof TrendsResponseSchema>;
-export type TrendsFilterOptions = z.infer<typeof TrendsFilterOptionsSchema>;
 export type TrendsOverviewCard = z.infer<typeof TrendsOverviewCardSchema>;
 export type TrendsTokensCard = z.infer<typeof TrendsTokensCardSchema>;
 export type TrendsTokensPerProvider = z.infer<typeof TrendsTokensPerProviderSchema>;
@@ -847,6 +848,8 @@ export const InvalidateCardsRequestSchema = z.object({
   start_date: z.string(),
   end_date: z.string().optional(),
   card_types: z.array(z.string()).min(1),
+  // nbrd: optional canonical provider filter applied to every target; omitted = all.
+  providers: z.array(z.string()).optional(),
   reason: z.string().min(1).max(500),
   dry_run: z.boolean().optional(),
   // kyrr: on execute (dry_run=false), the admin must echo the affected-session count
@@ -866,7 +869,7 @@ export const InvalidateCardsResponseSchema = z.object({
 });
 export type InvalidateCardsResponse = z.infer<typeof InvalidateCardsResponseSchema>;
 
-export const CardInvalidationRowSchema = z.object({
+const CardInvalidationRowSchema = z.object({
   id: z.number(),
   session_id: z.string(),
   admin_user_id: z.number(),
@@ -876,7 +879,6 @@ export const CardInvalidationRowSchema = z.object({
   correlation_id: z.string(),
   reason: z.string(),
 });
-export type CardInvalidationRow = z.infer<typeof CardInvalidationRowSchema>;
 
 export const CardInvalidationsListResponseSchema = z.object({
   rows: z.array(CardInvalidationRowSchema),
@@ -887,18 +889,42 @@ export type CardInvalidationsListResponse = z.infer<typeof CardInvalidationsList
 // stored session data whose family is absent from the active pricing table.
 // `last_seen` is the most recent tokens_v2 recompute time across the matching
 // sessions — a proxy for "last seen", not a true ingestion time.
-export const UnpricedModelRowSchema = z.object({
+const UnpricedModelRowSchema = z.object({
   provider: z.string(),
   family: z.string(),
   session_count: z.number(),
   last_seen: z.string(),
 });
-export type UnpricedModelRow = z.infer<typeof UnpricedModelRowSchema>;
 
 export const UnpricedModelsResponseSchema = z.object({
   models: z.array(UnpricedModelRowSchema),
 });
 export type UnpricedModelsResponse = z.infer<typeof UnpricedModelsResponseSchema>;
+
+// Precompute failures (6kbe): GET /admin/precompute-failures. Sessions the
+// worker quarantined from one precompute bucket after repeated failures.
+const PrecomputeFailureRowSchema = z.object({
+  session_id: z.string(),
+  user_id: z.number(),
+  external_id: z.string(),
+  provider: z.string(),
+  bucket: z.string(),
+  attempts: z.number(),
+  last_error: z.string(),
+  quarantined_at: z.string(),
+});
+export type PrecomputeFailureRow = z.infer<typeof PrecomputeFailureRowSchema>;
+
+export const PrecomputeFailuresResponseSchema = z.object({
+  failures: z.array(PrecomputeFailureRowSchema),
+});
+export type PrecomputeFailuresResponse = z.infer<typeof PrecomputeFailuresResponseSchema>;
+
+// POST /admin/precompute-failures/release and /release-all.
+export const ReleasePrecomputeFailuresResponseSchema = z.object({
+  released: z.number(),
+});
+export type ReleasePrecomputeFailuresResponse = z.infer<typeof ReleasePrecomputeFailuresResponseSchema>;
 
 // ============================================================================
 // Validation Functions

@@ -262,7 +262,9 @@ function attachTokenCountToAssistant(
     //   - `reasoning_output_tokens` is a SUBSET of `output_tokens`; pass the
     //     wire value through unchanged. Reasoning bills at the output rate
     //     implicitly and is preserved on the item for the tooltip sub-line.
-    //   - OpenAI does not charge for cache writes.
+    //   - `cacheWrite` stays 0: the rollout wire carries no cache-write count,
+    //     even though OpenAI's 5.6 and 6 families do have a cache-write rate
+    //     in the price table (md0z).
     const cached = delta.cached_input_tokens ?? 0;
     const reasoning = delta.reasoning_output_tokens ?? 0;
     const usage: TokenUsage = {
@@ -385,6 +387,18 @@ export function normalizeCodexLines(rawLines: RawCodexLine[]): CodexRenderItem[]
           separator.turnIndex = turnIndex;
         }
         if (modelUpdate) currentModel = modelUpdate;
+        break;
+      }
+      case 'token_usage_record': {
+        // pnkh: aggregate usage telemetry. Usage attribution belongs to
+        // event_msg.token_count alone (see attachTokenCountToAssistant); these
+        // per-turn/thread counters overlap it and would double-count.
+        break;
+      }
+      case 'world_state': {
+        // zgd6: periodic environment/instructions/skills snapshot. No consumer
+        // here or in the backend analyzers, so drop it rather than surface a
+        // row the reader can't act on.
         break;
       }
     }
@@ -699,6 +713,12 @@ function handleEventMsg(
       // top-level line already produces the CodexCompactedDivider, so this
       // sibling event is noise.
       return {};
+    case 'item_completed':
+      // pnkh: lifecycle mirror for every item type. AgentMessage duplicates
+      // the canonical response_item.message emitted milliseconds later; no
+      // other subtype has a transcript row of its own. Drop all subtypes, so
+      // future ones don't surface as CodexUnknownItem rows.
+      return {};
     case 'turn_aborted': {
       // CF-368: user-interrupted / replaced / review-ended / budget-limited
       // turn. Emit a divider row showing the reason and duration.
@@ -712,6 +732,33 @@ function handleEventMsg(
       items.push(aborted);
       return {};
     }
+    case 'thread_settings_applied':
+      // px58: config snapshot (model, approval policy, sandbox, ...), not
+      // conversation content.
+      return {};
+    case 'thread_goal_updated':
+    case 'thread_rolled_back':
+      // px58: internal thread bookkeeping (goal-tracking / rollback), no
+      // transcript row.
+      return {};
+    case 'agent_reasoning':
+    case 'agent_reasoning_raw_content':
+      // px58: legacy-history-mode mirror of response_item.reasoning.
+      return {};
+    case 'sub_agent_activity':
+      // px58: subagent lifecycle telemetry. The parent-side spawn_agent /
+      // wait_agent function_calls are already the source for subagent
+      // analytics, so this event adds no transcript row.
+      return {};
+    case 'entered_review_mode':
+    case 'exited_review_mode':
+      // px58: review-mode markers; not worth a dedicated divider today.
+      return {};
+    case 'image_generation_end':
+      // px58: no paired response_item.image_generation_call draft exists yet
+      // (that type is itself unhandled) — nothing to enrich. Real rendering
+      // is a separate follow-up.
+      return {};
   }
 }
 

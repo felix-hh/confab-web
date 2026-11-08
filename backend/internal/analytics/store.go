@@ -8,13 +8,7 @@ import (
 	"time"
 
 	"github.com/shopspring/decimal"
-	"go.opentelemetry.io/otel"
-	"go.opentelemetry.io/otel/attribute"
-	"go.opentelemetry.io/otel/codes"
-	"go.opentelemetry.io/otel/trace"
 )
-
-var tracer = otel.Tracer("confab/analytics")
 
 // Store provides database operations for session analytics cards.
 type Store struct {
@@ -173,7 +167,7 @@ func (r *ComputeResult) ToCards(sessionID string, lineCount int64) *Cards {
 // ToResponse converts Cards to an AnalyticsResponse for the API.
 func (c *Cards) ToResponse() *AnalyticsResponse {
 	response := &AnalyticsResponse{
-		Cards: make(map[string]interface{}),
+		Cards: make(map[string]any),
 	}
 
 	// Get ComputedAt and ComputedLines from the first available card
@@ -350,14 +344,10 @@ func (c *Cards) ToResponse() *AnalyticsResponse {
 
 // GetSmartRecapCard retrieves the smart recap card for a session.
 func (s *Store) GetSmartRecapCard(ctx context.Context, sessionID string) (*SmartRecapCardRecord, error) {
-	ctx, span := tracer.Start(ctx, "analytics.get_smart_recap_card",
-		trace.WithAttributes(attribute.String("session.id", sessionID)))
-	defer span.End()
-
 	query := `
 		SELECT session_id, version, computed_at, up_to_line,
 			recap, went_well, went_bad, human_suggestions, environment_suggestions, default_context_suggestions,
-			model_used, input_tokens, output_tokens, generation_time_ms,
+			model_used, llm_provider, input_tokens, output_tokens, generation_time_ms,
 			computing_started_at
 		FROM session_card_smart_recap
 		WHERE session_id = $1
@@ -365,6 +355,7 @@ func (s *Store) GetSmartRecapCard(ctx context.Context, sessionID string) (*Smart
 
 	var record SmartRecapCardRecord
 	var wentWellJSON, wentBadJSON, humanSuggestionsJSON, envSuggestionsJSON, contextSuggestionsJSON []byte
+	var llmProvider sql.NullString
 
 	err := s.db.QueryRowContext(ctx, query, sessionID).Scan(
 		&record.SessionID,
@@ -378,6 +369,7 @@ func (s *Store) GetSmartRecapCard(ctx context.Context, sessionID string) (*Smart
 		&envSuggestionsJSON,
 		&contextSuggestionsJSON,
 		&record.ModelUsed,
+		&llmProvider,
 		&record.InputTokens,
 		&record.OutputTokens,
 		&record.GenerationTimeMs,
@@ -387,10 +379,9 @@ func (s *Store) GetSmartRecapCard(ctx context.Context, sessionID string) (*Smart
 		return nil, nil
 	}
 	if err != nil {
-		span.RecordError(err)
-		span.SetStatus(codes.Error, err.Error())
 		return nil, err
 	}
+	record.LLMProvider = llmProviderOrDefault(llmProvider.String)
 
 	// Unmarshal JSONB arrays
 	if err := json.Unmarshal(wentWellJSON, &record.WentWell); err != nil {
@@ -414,10 +405,6 @@ func (s *Store) GetSmartRecapCard(ctx context.Context, sessionID string) (*Smart
 
 // UpsertSmartRecapCard inserts or updates a smart recap card, clearing the computing lock.
 func (s *Store) UpsertSmartRecapCard(ctx context.Context, record *SmartRecapCardRecord) error {
-	ctx, span := tracer.Start(ctx, "analytics.upsert_smart_recap_card",
-		trace.WithAttributes(attribute.String("session.id", record.SessionID)))
-	defer span.End()
-
 	wentWellJSON, err := json.Marshal(record.WentWell)
 	if err != nil {
 		return fmt.Errorf("marshaling went_well: %w", err)
@@ -443,9 +430,9 @@ func (s *Store) UpsertSmartRecapCard(ctx context.Context, record *SmartRecapCard
 		INSERT INTO session_card_smart_recap (
 			session_id, version, computed_at, up_to_line,
 			recap, went_well, went_bad, human_suggestions, environment_suggestions, default_context_suggestions,
-			model_used, input_tokens, output_tokens, generation_time_ms,
+			model_used, llm_provider, input_tokens, output_tokens, generation_time_ms,
 			computing_started_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, NULL)
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, NULL)
 		ON CONFLICT (session_id) DO UPDATE SET
 			version = EXCLUDED.version,
 			computed_at = EXCLUDED.computed_at,
@@ -457,6 +444,7 @@ func (s *Store) UpsertSmartRecapCard(ctx context.Context, record *SmartRecapCard
 			environment_suggestions = EXCLUDED.environment_suggestions,
 			default_context_suggestions = EXCLUDED.default_context_suggestions,
 			model_used = EXCLUDED.model_used,
+			llm_provider = EXCLUDED.llm_provider,
 			input_tokens = EXCLUDED.input_tokens,
 			output_tokens = EXCLUDED.output_tokens,
 			generation_time_ms = EXCLUDED.generation_time_ms,
@@ -475,24 +463,17 @@ func (s *Store) UpsertSmartRecapCard(ctx context.Context, record *SmartRecapCard
 		envSuggestionsJSON,
 		contextSuggestionsJSON,
 		record.ModelUsed,
+		sql.NullString{String: record.LLMProvider, Valid: record.LLMProvider != ""},
 		record.InputTokens,
 		record.OutputTokens,
 		record.GenerationTimeMs,
 	)
-	if err != nil {
-		span.RecordError(err)
-		span.SetStatus(codes.Error, err.Error())
-	}
 	return err
 }
 
 // AcquireSmartRecapLock attempts to acquire the computing lock for a smart recap.
 // Returns true if the lock was acquired, false if another process is already computing.
 func (s *Store) AcquireSmartRecapLock(ctx context.Context, sessionID string, lockTimeoutSeconds int) (bool, error) {
-	ctx, span := tracer.Start(ctx, "analytics.acquire_smart_recap_lock",
-		trace.WithAttributes(attribute.String("session.id", sessionID)))
-	defer span.End()
-
 	// Atomically set the lock if it doesn't exist or is stale
 	query := `
 		INSERT INTO session_card_smart_recap (
@@ -512,25 +493,17 @@ func (s *Store) AcquireSmartRecapLock(ctx context.Context, sessionID string, loc
 	err := s.db.QueryRowContext(ctx, query, sessionID, lockTimeoutSeconds).Scan(&returnedID)
 	if err == sql.ErrNoRows {
 		// Lock not acquired - another process has it
-		span.SetAttributes(attribute.Bool("lock.acquired", false))
 		return false, nil
 	}
 	if err != nil {
-		span.RecordError(err)
-		span.SetStatus(codes.Error, err.Error())
 		return false, err
 	}
 
-	span.SetAttributes(attribute.Bool("lock.acquired", true))
 	return true, nil
 }
 
 // ClearSmartRecapLock clears the computing lock (e.g., on error).
 func (s *Store) ClearSmartRecapLock(ctx context.Context, sessionID string) error {
-	ctx, span := tracer.Start(ctx, "analytics.clear_smart_recap_lock",
-		trace.WithAttributes(attribute.String("session.id", sessionID)))
-	defer span.End()
-
 	query := `
 		UPDATE session_card_smart_recap
 		SET computing_started_at = NULL
@@ -538,10 +511,6 @@ func (s *Store) ClearSmartRecapLock(ctx context.Context, sessionID string) error
 	`
 
 	_, err := s.db.ExecContext(ctx, query, sessionID)
-	if err != nil {
-		span.RecordError(err)
-		span.SetStatus(codes.Error, err.Error())
-	}
 	return err
 }
 
@@ -555,10 +524,6 @@ func (s *Store) ClearSmartRecapLock(ctx context.Context, sessionID string) error
 //   - Weight B: smart recap content
 //   - Weight C: user messages from transcript
 func (s *Store) UpsertSearchIndex(ctx context.Context, record *SearchIndexRecord, content *SearchIndexContent) error {
-	ctx, span := tracer.Start(ctx, "analytics.upsert_search_index",
-		trace.WithAttributes(attribute.String("session.id", record.SessionID)))
-	defer span.End()
-
 	query := `
 		INSERT INTO session_search_index (
 			session_id, version, content_text, search_vector,
@@ -591,10 +556,6 @@ func (s *Store) UpsertSearchIndex(ctx context.Context, record *SearchIndexRecord
 		record.RecapIndexedAt,    // $8
 		record.MetadataHash,      // $9
 	)
-	if err != nil {
-		span.RecordError(err)
-		span.SetStatus(codes.Error, err.Error())
-	}
 	return err
 }
 

@@ -19,8 +19,6 @@ import (
 	"github.com/ConfabulousDev/confab-web/internal/logger"
 	"github.com/ConfabulousDev/confab-web/internal/storage"
 	"github.com/ConfabulousDev/confab-web/internal/validation"
-	"github.com/honeycombio/otel-config-go/otelconfig"
-	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 )
 
 // Build identity, injected via -ldflags at release/deploy time (see Dockerfile,
@@ -46,16 +44,6 @@ func main() {
 	// Access via: fly proxy 6060:6060 -a confab-backend
 	if os.Getenv("ENABLE_PPROF") == "true" {
 		go startPprofServer()
-	}
-
-	// Initialize OpenTelemetry (sends traces to Honeycomb)
-	// Configured via env vars: OTEL_SERVICE_NAME, OTEL_EXPORTER_OTLP_ENDPOINT, OTEL_EXPORTER_OTLP_HEADERS
-	otelShutdown, err := otelconfig.ConfigureOpenTelemetry()
-	if err != nil {
-		logger.Warn("failed to configure OpenTelemetry", "error", err)
-		// Non-fatal: continue without tracing if OTEL env vars not set
-	} else {
-		defer otelShutdown()
 	}
 
 	// Load configuration from environment
@@ -97,9 +85,6 @@ func main() {
 	}
 	if os.Getenv("ENABLE_SAAS_FOOTER") == "true" {
 		logger.Info("SaaS footer enabled: ENABLE_SAAS_FOOTER=true")
-	}
-	if os.Getenv("ENABLE_SAAS_TERMLY") == "true" {
-		logger.Info("SaaS Termly consent enabled: ENABLE_SAAS_TERMLY=true")
 	}
 
 	// Bootstrap admin user if password auth is enabled and no users exist
@@ -149,14 +134,10 @@ func main() {
 	})
 	router := server.SetupRoutes()
 
-	// Wrap router with OpenTelemetry HTTP instrumentation
-	// This automatically traces all incoming HTTP requests
-	handler := otelhttp.NewHandler(router, "confabulous-backend-prod")
-
 	// HTTP server configuration
 	httpServer := &http.Server{
 		Addr:         fmt.Sprintf(":%d", config.Port),
-		Handler:      handler,
+		Handler:      router,
 		ReadTimeout:  config.ReadTimeout,  // Configurable via HTTP_READ_TIMEOUT (default: 30s)
 		WriteTimeout: config.WriteTimeout, // Configurable via HTTP_WRITE_TIMEOUT (default: 30s)
 		IdleTimeout:  60 * time.Second,
@@ -289,7 +270,7 @@ func loadConfig() Config {
 	// Parse allowed email domains (optional, for on-prem deployments)
 	if allowedDomainsEnv := os.Getenv("ALLOWED_EMAIL_DOMAINS"); allowedDomainsEnv != "" {
 		var domains []string
-		for _, d := range strings.Split(allowedDomainsEnv, ",") {
+		for d := range strings.SplitSeq(allowedDomainsEnv, ",") {
 			d = strings.ToLower(strings.TrimSpace(d))
 			if d != "" {
 				domains = append(domains, d)
@@ -357,7 +338,7 @@ func loadConfig() Config {
 	// for cookie-based sessions). Browsers should refuse this combination, but
 	// some lenient clients honor it — fail loudly at startup so an operator
 	// can't silently expose authenticated endpoints to every origin.
-	for _, o := range strings.Split(allowedOrigins, ",") {
+	for o := range strings.SplitSeq(allowedOrigins, ",") {
 		if strings.TrimSpace(o) == "*" {
 			logFatal("invalid env var", "var", "ALLOWED_ORIGINS", "error", "wildcard '*' is not allowed: AllowCredentials=true requires an explicit origin list")
 		}

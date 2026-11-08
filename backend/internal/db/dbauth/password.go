@@ -7,9 +7,6 @@ import (
 	"strings"
 	"time"
 
-	"go.opentelemetry.io/otel/attribute"
-	"go.opentelemetry.io/otel/codes"
-	"go.opentelemetry.io/otel/trace"
 	"golang.org/x/crypto/bcrypt"
 
 	"github.com/ConfabulousDev/confab-web/internal/db"
@@ -20,19 +17,29 @@ import (
 const (
 	MaxFailedAttempts = 5
 	LockoutDuration   = 15 * time.Minute
+
+	// BcryptCost is the cost factor for bcrypt hashing.
+	// 12 is a good balance of security and performance (~250ms on modern hardware).
+	// It lives here rather than in internal/auth (which aliases it as
+	// auth.BcryptCost) because auth imports dbauth, and dummyPasswordHash must
+	// stay at the same cost.
+	BcryptCost = 12
 )
+
+// dummyPasswordHash is a real bcrypt hash at BcryptCost of a random,
+// discarded string. AuthenticatePassword compares against it when no password
+// identity matches the email, so an unknown email costs the same bcrypt work
+// as a known email with a wrong password. It must be a well-formed hash at
+// BcryptCost: bcrypt rejects a malformed hash before doing any key expansion,
+// which would reopen the user-enumeration timing gap. Regenerate it if
+// BcryptCost changes (TestDummyPasswordHashIsValidAtBcryptCost enforces this).
+const dummyPasswordHash = "$2a$12$baXy3aUqA6YTfCrnFu9Iv.Y.fkuZA/N/tVOakmzltx87fa3xkl1GC"
 
 // AuthenticatePassword verifies email/password and returns the user if valid.
 // Handles account lockout after too many failed attempts.
 func (s *Store) AuthenticatePassword(ctx context.Context, email, password string) (*models.User, error) {
-	ctx, span := tracer.Start(ctx, "db.authenticate_password",
-		trace.WithAttributes(attribute.String("email", email)))
-	defer span.End()
-
 	tx, err := s.conn().BeginTx(ctx, nil)
 	if err != nil {
-		span.RecordError(err)
-		span.SetStatus(codes.Error, err.Error())
 		return nil, fmt.Errorf("failed to begin transaction: %w", err)
 	}
 	defer tx.Rollback()
@@ -62,13 +69,13 @@ func (s *Store) AuthenticatePassword(ctx context.Context, email, password string
 	)
 
 	if err == sql.ErrNoRows {
-		// No such user - but use constant time to prevent timing attacks
-		bcrypt.CompareHashAndPassword([]byte("$2a$12$dummy.hash.to.prevent.timing.attacks."), []byte(password))
+		// No such user: still pay a full-cost bcrypt comparison so response
+		// timing doesn't reveal whether the email exists. The result is
+		// irrelevant; the caller always gets ErrInvalidCredentials.
+		_ = bcrypt.CompareHashAndPassword([]byte(dummyPasswordHash), []byte(password))
 		return nil, db.ErrInvalidCredentials
 	}
 	if err != nil {
-		span.RecordError(err)
-		span.SetStatus(codes.Error, err.Error())
 		return nil, fmt.Errorf("failed to query password identity: %w", err)
 	}
 
@@ -89,7 +96,6 @@ func (s *Store) AuthenticatePassword(ctx context.Context, email, password string
 
 		updateSQL := `UPDATE identity_passwords SET failed_attempts = $1, locked_until = $2, updated_at = NOW() WHERE identity_id = $3`
 		if _, err = tx.ExecContext(ctx, updateSQL, newAttempts, newLockedUntil, identityID); err != nil {
-			span.RecordError(err)
 			return nil, fmt.Errorf("failed to update failed attempts: %w", err)
 		}
 
@@ -111,7 +117,6 @@ func (s *Store) AuthenticatePassword(ctx context.Context, email, password string
 	// Success - reset failed attempts
 	resetSQL := `UPDATE identity_passwords SET failed_attempts = 0, locked_until = NULL, updated_at = NOW() WHERE identity_id = $1`
 	if _, err = tx.ExecContext(ctx, resetSQL, identityID); err != nil {
-		span.RecordError(err)
 		return nil, fmt.Errorf("failed to reset failed attempts: %w", err)
 	}
 
@@ -119,7 +124,6 @@ func (s *Store) AuthenticatePassword(ctx context.Context, email, password string
 		return nil, fmt.Errorf("failed to commit: %w", err)
 	}
 
-	span.SetAttributes(attribute.Int64("user.id", user.ID))
 	return &user, nil
 }
 
@@ -133,21 +137,14 @@ const bootstrapAdvisoryLockKey int64 = 7421968455123001 // "7ys0 bootstrap"
 // CreatePasswordUser creates a new user with password authentication.
 // Creates entries in users, user_identities, and identity_passwords tables.
 func (s *Store) CreatePasswordUser(ctx context.Context, email, passwordHash string, isAdmin bool) (*models.User, error) {
-	ctx, span := tracer.Start(ctx, "db.create_password_user",
-		trace.WithAttributes(attribute.String("email", email), attribute.Bool("is_admin", isAdmin)))
-	defer span.End()
-
 	tx, err := s.conn().BeginTx(ctx, nil)
 	if err != nil {
-		span.RecordError(err)
-		span.SetStatus(codes.Error, err.Error())
 		return nil, fmt.Errorf("failed to begin transaction: %w", err)
 	}
 	defer tx.Rollback()
 
 	user, err := createPasswordUserTx(ctx, tx, email, passwordHash, isAdmin)
 	if err != nil {
-		span.RecordError(err)
 		return nil, err
 	}
 
@@ -155,7 +152,6 @@ func (s *Store) CreatePasswordUser(ctx context.Context, email, passwordHash stri
 		return nil, fmt.Errorf("failed to commit: %w", err)
 	}
 
-	span.SetAttributes(attribute.Int64("user.id", user.ID))
 	return user, nil
 }
 
@@ -231,14 +227,8 @@ func createPasswordUserTx(ctx context.Context, tx *sql.Tx, email, passwordHash s
 // bootstrapped (the loser path — not an error). Returns an error only on a real
 // DB failure.
 func (s *Store) BootstrapPasswordAdmin(ctx context.Context, email, passwordHash string) (user *models.User, created bool, err error) {
-	ctx, span := tracer.Start(ctx, "db.bootstrap_password_admin",
-		trace.WithAttributes(attribute.String("email", email)))
-	defer span.End()
-
 	tx, err := s.conn().BeginTx(ctx, nil)
 	if err != nil {
-		span.RecordError(err)
-		span.SetStatus(codes.Error, err.Error())
 		return nil, false, fmt.Errorf("failed to begin transaction: %w", err)
 	}
 	defer tx.Rollback()
@@ -247,14 +237,12 @@ func (s *Store) BootstrapPasswordAdmin(ctx context.Context, email, passwordHash 
 	// the transaction ends (commit or rollback), so the recheck + create below
 	// run with exclusive access against any other bootstrapping transaction.
 	if _, err = tx.ExecContext(ctx, `SELECT pg_advisory_xact_lock($1)`, bootstrapAdvisoryLockKey); err != nil {
-		span.RecordError(err)
 		return nil, false, fmt.Errorf("failed to acquire bootstrap advisory lock: %w", err)
 	}
 
 	// Re-check inside the lock: a peer may have created the admin while we waited.
 	var count int
 	if err = tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM users`).Scan(&count); err != nil {
-		span.RecordError(err)
 		return nil, false, fmt.Errorf("failed to count users: %w", err)
 	}
 	if count > 0 {
@@ -264,7 +252,6 @@ func (s *Store) BootstrapPasswordAdmin(ctx context.Context, email, passwordHash 
 
 	user, err = createPasswordUserTx(ctx, tx, email, passwordHash, true /* isAdmin */)
 	if err != nil {
-		span.RecordError(err)
 		return nil, false, err
 	}
 
@@ -272,16 +259,11 @@ func (s *Store) BootstrapPasswordAdmin(ctx context.Context, email, passwordHash 
 		return nil, false, fmt.Errorf("failed to commit: %w", err)
 	}
 
-	span.SetAttributes(attribute.Int64("user.id", user.ID))
 	return user, true, nil
 }
 
 // UpdateUserPassword updates a user's password hash
 func (s *Store) UpdateUserPassword(ctx context.Context, userID int64, passwordHash string) error {
-	ctx, span := tracer.Start(ctx, "db.update_user_password",
-		trace.WithAttributes(attribute.Int64("user.id", userID)))
-	defer span.End()
-
 	query := `
 		UPDATE identity_passwords p
 		SET password_hash = $1, failed_attempts = 0, locked_until = NULL, updated_at = NOW()
@@ -291,8 +273,6 @@ func (s *Store) UpdateUserPassword(ctx context.Context, userID int64, passwordHa
 
 	result, err := s.conn().ExecContext(ctx, query, passwordHash, userID)
 	if err != nil {
-		span.RecordError(err)
-		span.SetStatus(codes.Error, err.Error())
 		return fmt.Errorf("failed to update password: %w", err)
 	}
 
@@ -310,9 +290,6 @@ func (s *Store) UpdateUserPassword(ctx context.Context, userID int64, passwordHa
 
 // GetUserByEmail retrieves a user by email address
 func (s *Store) GetUserByEmail(ctx context.Context, email string) (*models.User, error) {
-	ctx, span := tracer.Start(ctx, "db.get_user_by_email")
-	defer span.End()
-
 	query := `SELECT id, email, name, avatar_url, status, read_only, created_at, updated_at FROM users WHERE email = $1`
 
 	var user models.User
@@ -323,8 +300,6 @@ func (s *Store) GetUserByEmail(ctx context.Context, email string) (*models.User,
 		if err == sql.ErrNoRows {
 			return nil, db.ErrUserNotFound
 		}
-		span.RecordError(err)
-		span.SetStatus(codes.Error, err.Error())
 		return nil, fmt.Errorf("failed to get user: %w", err)
 	}
 
@@ -333,10 +308,6 @@ func (s *Store) GetUserByEmail(ctx context.Context, email string) (*models.User,
 
 // IsUserAdmin checks if a user has admin privileges
 func (s *Store) IsUserAdmin(ctx context.Context, userID int64) (bool, error) {
-	ctx, span := tracer.Start(ctx, "db.is_user_admin",
-		trace.WithAttributes(attribute.Int64("user.id", userID)))
-	defer span.End()
-
 	query := `SELECT is_admin FROM users WHERE id = $1`
 
 	var isAdmin bool
@@ -345,8 +316,6 @@ func (s *Store) IsUserAdmin(ctx context.Context, userID int64) (bool, error) {
 		if err == sql.ErrNoRows {
 			return false, db.ErrUserNotFound
 		}
-		span.RecordError(err)
-		span.SetStatus(codes.Error, err.Error())
 		return false, fmt.Errorf("failed to check admin status: %w", err)
 	}
 

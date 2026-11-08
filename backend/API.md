@@ -4,7 +4,7 @@ This document describes the backend API surface for the Confab web application. 
 
 ## Authentication
 
-The API uses two authentication methods:
+Endpoints use one of four authentication modes. Each endpoint section below names the mode it requires.
 
 ### 1. API Key Authentication (CLI)
 Used by CLI tools. All CLI requests include these headers:
@@ -16,7 +16,13 @@ User-Agent: confab/1.2.3 (darwin; arm64)
 The `User-Agent` header includes CLI version, OS, and architecture.
 
 ### 2. Session Cookie Authentication (Web)
-Used by the web frontend. Session cookie (`confab_session`) is set after OAuth login. CSRF protection is provided automatically via Fetch metadata validation (no token required).
+Used by the web frontend. Session cookie (`confab_session`) is set after OAuth or password login. CSRF protection is provided automatically via Fetch metadata validation (no token required). Requests without a valid session get `401`.
+
+### 3. Session Cookie or API Key
+A few endpoints shared by the CLI and the web UI accept either credential (see [Session Cookie or API Key](#session-cookie-or-api-key)). CSRF validation runs only when the request authenticates with the session cookie; `Authorization: Bearer` requests skip it.
+
+### 4. Optional Authentication (Canonical Session Access)
+Canonical session reads (see [Canonical Session Access](#canonical-session-access-optional-auth)) resolve the caller in this order: API key, then session cookie, then demo auto-impersonation (when `DEMO_IDENTITY_EMAIL` is set), then anonymous. Anonymous callers reach only public shares. When `ALLOWED_EMAIL_DOMAINS` is set, anonymous requests get `401` instead.
 
 ## Base URL
 
@@ -175,7 +181,7 @@ Content-Encoding: zstd  (optional, for compressed payloads)
 | `metadata` | object | No | Optional metadata (only processed for transcript files) |
 | `metadata.git_info` | object | No | Git repository metadata. See [`git_info` fields](#git_info-fields). |
 | `metadata.summary` | string | No | Session summary (nil=don't update, ""=clear) |
-| `metadata.first_user_message` | string | No | First user message (nil=don't update, ""=clear). For **cursor** sessions the value is unwrapped from its `<user_query>…</user_query>` envelope before validation/storage so the session-list title shows the human prompt, not the raw tags; a value with no envelope is stored verbatim, and an empty query is dropped (leaves the existing title unchanged). See [Cursor Metadata](#cursor-metadata) below. |
+| `metadata.first_user_message` | string | No | First user message (nil=don't update, ""=clear). For **cursor** sessions the value is unwrapped from its `<user_query>…</user_query>` envelope before validation/storage so the session-list title shows the human prompt, not the raw tags; a value with no envelope is stored verbatim, and an empty query is dropped (leaves the existing title unchanged). See [Cursor Metadata](#cursor-metadata) below. For **codex** sessions an omitted field is derived server-side from the chunk's own lines — see [Codex first user message](#codex-first-user-message) below. |
 | `metadata.latest_message_at` | string (RFC3339) | No | Explicit latest-message timestamp for providers whose transcript lines carry none (cursor). When present on a transcript chunk, it advances `session.last_message_at` the same way per-line timestamp extraction does for other providers. Values more than 48h in the future are silently dropped (the chunk still returns 200) to prevent sort-order abuse; `last_message_at` is left unchanged. Ignored for providers that already extract per-line timestamps. See [Cursor Metadata](#cursor-metadata) below. |
 | `metadata.created_at` | string (RFC3339) | No | Explicit session creation time, the start anchor for estimating a cursor session's duration (cursor lines carry no per-line timestamp). When present and earlier than the session's current `first_seen`, it lowers `first_seen` to refine the start anchor; a later value never raises it. Values more than 48h in the future are silently dropped (chunk still returns 200). Ignored for providers that already extract per-line timestamps. See [Cursor Metadata](#cursor-metadata) below. |
 | `metadata.model` | string | No | Model that produced a cursor session (the cursor JSONL has no model field). On a cursor transcript chunk a non-empty value is persisted (first non-empty wins) and surfaced as `cards.session.models_used`. Length capped at 255. See [Cursor Metadata](#cursor-metadata) below. |
@@ -213,6 +219,32 @@ exact names so the run grouping (`<runId>`) is recoverable from the path alone:
   [`GET /api/v1/capabilities`](#capabilities); older backends omit that endpoint,
   and the CLI then skips workflow uploads.
 
+#### Codex first user message
+
+Codex sessions never carry a `summary` (a Claude-only concept), so their
+visibility in the session list — and their inclusion in Trends and
+cost-by-model — rests entirely on `first_user_message`. When a codex
+**transcript** chunk with `first_line: 1` arrives **without**
+`metadata.first_user_message`, the backend derives the value from the chunk's
+own lines instead of leaving the column NULL:
+
+- Read from the `event_msg` stream only, in both wire shapes Codex has emitted:
+  `payload.type: "user_message"` (CLI <= 0.130.0) and `payload.type:
+  "item_completed"` wrapping an `item.type: "UserMessage"` (CLI >= 0.149.1).
+  The user-role `response_item` stream is never read — it carries injected
+  context (`<environment_context>`, `AGENTS.md`), not the human prompt.
+- The first derivable line in the chunk wins; later user messages are ignored.
+- A client-supplied `metadata.first_user_message` always wins verbatim, and its
+  presence suppresses derivation entirely.
+- Derivation runs on the first chunk only (`first_line: 1`). Sessions whose
+  first chunk was uploaded before this behavior existed keep a NULL column.
+- An underivable or whitespace-only result leaves the column NULL — never an
+  empty-string title.
+- A derived value longer than the 8192-byte column limit is truncated on a rune
+  boundary rather than rejected (client-supplied values over the limit are still
+  a 400).
+- The stored JSONL is unchanged; this is read-side interpretation only.
+
 #### Codex Rollout Metadata
 
 When the session's provider is `codex`, each chunk may carry a `codex_rollout`
@@ -224,7 +256,7 @@ parent-child tree shape and per-thread metadata.
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | `thread_uuid` | string | Yes | UUID identifying the thread. Required, must be a valid UUID. |
-| `parent_thread_uuid` | string | No | UUID of the parent thread. Omit for root rollouts. If provided: must be a valid UUID and must not equal `thread_uuid`. An explicit empty string is rejected. Orphan parents (referencing UUIDs not yet uploaded) are allowed. |
+| `parent_thread_uuid` | string | No | UUID of the parent thread. Omit for root rollouts. If provided: must be a valid UUID and must not equal `thread_uuid`, compared as parsed UUIDs (so differently-cased, unhyphenated or braced spellings of the same UUID count as equal). An explicit empty string is rejected. Orphan parents (referencing UUIDs not yet uploaded) are allowed. |
 | `rollout_path` | string | Yes | Filesystem path to the Codex rollout JSONL on the CLI host. ≤ 8192 chars. |
 | `cwd` | string | No | Working directory. ≤ 8192 chars. |
 | `model` | string | No | Model name. ≤ 255 chars. |
@@ -237,7 +269,7 @@ parent-child tree shape and per-thread metadata.
 **Validation errors (400):**
 - `codex_rollout` on a non-codex session
 - Missing or invalid `thread_uuid`
-- Invalid `parent_thread_uuid` (empty string when set, malformed UUID, equal to `thread_uuid`)
+- Invalid `parent_thread_uuid` (empty string when set, malformed UUID, the same UUID as `thread_uuid` in any spelling)
 - Missing `rollout_path`
 - Any field exceeding its length limit
 
@@ -384,7 +416,7 @@ Authorization: Bearer <api_key>
 }
 ```
 
-**Access rules:** Follows the canonical access model (CF-132). Owner always has access. Recipient shares, system shares, and public shares also grant access. The `SHARE_ALL_SESSIONS` env var (on-prem) is respected.
+**Access rules:** Follows the canonical access model (CF-132). Owner always has access. Recipient shares, system shares, and public shares also grant access. The `SHARE_ALL_SESSIONS_TO_AUTHENTICATED` env var (on-prem) is respected.
 
 **Error responses:**
 - `400` — Invalid `max_chars` value
@@ -460,6 +492,32 @@ Uses canonical access model (CF-132). Validates the file exists in the session's
 - `404` — Session not found, no access, or file not found
 
 ---
+
+## Web Endpoints (Session Auth)
+
+Endpoints used by the web dashboard. All require [session cookie authentication](#2-session-cookie-authentication-web) (CSRF enforced via Fetch metadata); a missing or invalid session returns `401`. "Owner" in the Auth column means the caller must own the session; non-owners get `403` or `404`, depending on the endpoint.
+
+| Method | Path | Auth | Description |
+|--------|------|------|-------------|
+| `GET` | `/api/v1/me` | Session | Current user, plus onboarding flags `has_own_sessions` and `has_api_keys`, and `is_admin` (`SUPER_ADMIN_EMAILS` or `users.is_admin`). |
+| `POST` | `/api/v1/keys` | Session | Create an API key from `{"name": "..."}` (default `"API Key"`). The raw `key` appears only in this response. `409` on a duplicate name or the per-user key limit. |
+| `GET` | `/api/v1/keys` | Session | List the caller's API keys (`id`, `user_id`, `name`, `created_at`, `last_used_at`; never the key). |
+| `DELETE` | `/api/v1/keys/{id}` | Session | Delete one of the caller's API keys. `204`; `404` if not found. |
+| `GET` | `/api/v1/sessions` | Session | Cursor-paginated list of sessions visible to the caller (owned, recipient-shared, system-shared, or all sessions with `SHARE_ALL_SESSIONS_TO_AUTHENTICATED=true`), plus filter options. Query: `repo`, `branch`, `owner`, `pr`, `provider` (comma-separated), `q`, `cursor`. |
+| `PATCH` | `/api/v1/sessions/{id}/title` | Session, owner | Set `custom_title` (max 255 chars), or `null` to revert to the derived title. Returns the updated session detail. |
+| `DELETE` | `/api/v1/sessions/{id}` | Session, owner | Delete a session, its stored transcript chunks, and dependent rows (sync files, shares). |
+| `POST` | `/api/v1/sessions/{id}/share` | Session, owner | Create a share from `is_public`, `recipients` (required unless public), `expires_in_days`, `skip_notifications`. Emails recipients unless skipped. `403` when `ENABLE_SHARE_CREATION` is off; `429` on the daily share or email quota. |
+| `GET` | `/api/v1/sessions/{id}/shares` | Session, owner | List shares for one session. |
+| `GET` | `/api/v1/shares` | Session | List shares across all sessions the caller owns. |
+| `DELETE` | `/api/v1/shares/{shareID}` | Session, owner | Revoke a share. `204`; `404` if not found or not the caller's. |
+| `DELETE` | `/api/v1/sessions/{id}/github-links/{linkID}` | Session, owner | Remove a GitHub link from a session. `204`. |
+| `POST` | `/api/v1/sessions/{id}/analytics/smart-recap/regenerate` | Session, owner | Regenerate the smart recap synchronously and return it in the [session analytics](#get-session-analytics) response shape. `404` when smart recap is disabled; `403` for non-owners or an exhausted recap quota; `409` while a generation is in progress. |
+| `POST` | `/api/v1/client-errors` | Session | Log frontend error reports (e.g. transcript schema drift) server-side. Body: `category`, `errors` (1-50 items, each with non-empty `details`), optional `session_id` and `context`. |
+| `GET` | `/api/v1/trends` | Session | Aggregated analytics across visible sessions. See [Trends](#trends-aggregated-analytics). |
+| `GET` | `/api/v1/org/analytics` | Session | Per-user organization analytics. Registered only when `ENABLE_ORG_ANALYTICS=true`. See [Organization Analytics](#organization-analytics). |
+| `GET` | `/api/v1/org/repos` | Session | Repo list for the organization filter. Registered only when `ENABLE_ORG_ANALYTICS=true`. See [List Organization Repos](#list-organization-repos). |
+
+Admin routes under `/api/v1/admin/` use the same session + CSRF chain plus an admin check; see [Admin Endpoints](#admin-endpoints-super-admin-only).
 
 ### Trends (Aggregated Analytics)
 
@@ -795,6 +853,30 @@ Requires `ENABLE_ORG_ANALYTICS=true`. Same privacy model and middleware chain as
 
 ---
 
+## Session Cookie or API Key
+
+These endpoints accept either a session cookie or an `Authorization: Bearer` API key. CSRF validation runs only for cookie-authenticated requests.
+
+| Method | Path | Auth | Description |
+|--------|------|------|-------------|
+| `GET` | `/api/v1/sessions/by-external-id/{external_id}` | Session or API key | Look up one of the caller's own sessions by its CLI `external_id`. Returns `{"session_id": "<uuid>"}`; `404` if not found or not owned. |
+| `POST` | `/api/v1/sessions/{id}/github-links` | Session or API key, owner | Link a GitHub PR or commit URL to a session. Body: `url`, `source` (`cli_hook` or `manual`), optional `link_type` (must match the URL) and `title`. Returns `201` with the created link. |
+
+---
+
+## Canonical Session Access (Optional Auth)
+
+Session reads that serve owners, share recipients, and anonymous viewers of public shares from one URL. Authentication is [optional](#4-optional-authentication-canonical-session-access). Access resolves in order: owner, then recipient share, then system share (any authenticated user; every session when `SHARE_ALL_SESSIONS_TO_AUTHENTICATED=true`), then public share. The [External API](#external-api-endpoints-api-key-auth) endpoints use the same model with API key auth.
+
+Unless noted, a caller without access gets `401` ("Sign in to view this session") when the session has non-public shares that signing in could unlock, otherwise `404`. A session whose owner is deactivated returns `403`.
+
+| Method | Path | Auth | Description |
+|--------|------|------|-------------|
+| `GET` | `/api/v1/sessions/{id}` | Optional | Session detail: metadata, git info, and `files` (sync files with `last_synced_line`). `hostname`, `username`, `cwd`, and `transcript_path` are owner-only; public-share viewers don't receive `owner_email`. |
+| `GET` | `/api/v1/sessions/{id}/sync/file` | Optional | Raw JSONL of one sync file as `text/plain`. Query: `file_name` (required), `line_offset` (return only lines whose absolute line number is greater than it; every returned line ends in `\n`). No access returns `404`. |
+| `GET` | `/api/v1/sessions/{id}/analytics` | Optional | Computed session analytics. See [Get Session Analytics](#get-session-analytics). |
+| `GET` | `/api/v1/sessions/{id}/github-links` | Optional | `{"links": [...]}` for anyone with session access; `404` otherwise. |
+
 ### Session Analytics
 
 #### Get Session Analytics
@@ -802,7 +884,7 @@ Requires `ENABLE_ORG_ANALYTICS=true`. Same privacy model and middleware chain as
 GET /api/v1/sessions/{id}/analytics?as_of_line=<n>
 ```
 
-Returns computed analytics for a session. Uses the same canonical access model as Get Session Detail.
+Returns computed analytics for a session. Uses the same canonical access model as `GET /api/v1/sessions/{id}` (see [Canonical Session Access](#canonical-session-access-optional-auth)).
 
 **Query Parameters:**
 | Parameter | Type | Required | Description |
@@ -812,6 +894,12 @@ Returns computed analytics for a session. Uses the same canonical access model a
 **Conditional Request Behavior:**
 - If `as_of_line` >= current transcript line count: returns `304 Not Modified`
 - Useful for polling: pass the `computed_lines` from a previous response to avoid redundant computation
+
+**Caching and staleness:**
+- Cards are cached per session. When the session has grown since the cards were computed, the endpoint returns the cached cards immediately with the **old** `computed_lines`, which is then lower than the current line count. Clients should keep polling with `as_of_line=<computed_lines>`; the response catches up once a refresh lands.
+- A background refresh starts only when the cached cards are more than 2 minutes old, so a live session's analytics lag by up to about 2 minutes plus the compute time.
+- On first view, or after a card schema version change, the request waits for the compute. Concurrent requests for the same session share one compute. If the client disconnects, the compute still finishes and caches its result.
+- `validation_error_count` is set only on a response that waited for a fresh compute.
 
 **Response:**
 ```json
@@ -943,7 +1031,7 @@ Returns computed analytics for a session. Uses the same canonical access model a
 | Field | Type | Description |
 |-------|------|-------------|
 | `computed_at` | string | ISO timestamp when analytics were computed |
-| `computed_lines` | int | Line count through which analytics are computed |
+| `computed_lines` | int | Line count through which analytics are computed. May be lower than the session's current line count when stale cards are served; see *Caching and staleness* |
 | `tokens.*` | object | *Deprecated:* Use `cards.tokens` instead |
 | `cost.*` | object | *Deprecated:* Use `cards.tokens.estimated_usd` instead |
 | `compaction.*` | object | *Deprecated:* Use `cards.session` instead |
@@ -1001,6 +1089,12 @@ Returns computed analytics for a session. Uses the same canonical access model a
 | `cards.workflows.runs[].succeeded_agents` | int | Agents with a journal `result` line (0 when `has_journal` is false) |
 | `cards.workflows.runs[].has_journal` | bool | Whether a run journal was uploaded; when false, `succeeded_agents` is not meaningful |
 | `cards.workflows.runs[].duration_ms` | int | Activity span from the run's first to last agent timestamp (0 if unknown) |
+| `cards.smart_recap` | object\|null | AI-generated recap (omitted when smart recap is disabled, not yet generated, or unavailable — see `smart_recap_missing_reason`) |
+| `cards.smart_recap.recap` | string | Short recap of the session |
+| `cards.smart_recap.went_well` / `went_bad` / `human_suggestions` / `environment_suggestions` / `default_context_suggestions` | array | Items of `{text, message_id?}`; `message_id` is a transcript message UUID when present |
+| `cards.smart_recap.computed_at` | string | RFC 3339 timestamp of generation |
+| `cards.smart_recap.model_used` | string | Model id that generated the recap — an Anthropic (e.g. `claude-haiku-4-5-20251001`) or OpenAI (e.g. `gpt-6-luna`) model id |
+| `cards.smart_recap.llm_provider` | string | LLM provider that generated the recap: `"anthropic"` or `"openai"`. Always present; recaps generated before this field existed report `"anthropic"` |
 | `card_errors` | object\|null | Map of card key to error message for failed computations (graceful degradation) |
 | `smart_recap_quota` | object\|null | Per-user quota info (present when quota is capped and viewer is owner; omitted when unlimited or non-owner) |
 | `smart_recap_quota.used` | int | Recaps generated this month |
@@ -1037,17 +1131,19 @@ Example with partial failure:
 
 ## OAuth Endpoints (No prefix)
 
-These endpoints handle OAuth authentication flow:
+These endpoints handle browser and CLI login. Provider login/callback routes are registered only when that provider is configured.
 
 | Endpoint | Description |
 |----------|-------------|
+| `POST /auth/password/login` | Password login (form fields `email`, `password`, optional `redirect`). Sets the session cookie and redirects (303) to the pending CLI authorize flow if a `cli_redirect` cookie is set, else to `redirect` (a relative path: `/auth…` stays a backend path, anything else gets `FRONTEND_URL` prepended; unsafe values are ignored), else to `FRONTEND_URL`. Any `post_login_redirect` cookie is cleared and ignored. A password over 72 bytes redirects to `/login?error=Password is too long` without counting as a failed attempt. Registered only when password auth is enabled. |
 | `GET /auth/github/login` | Initiate GitHub OAuth |
 | `GET /auth/github/callback` | GitHub OAuth callback |
 | `GET /auth/google/login` | Initiate Google OAuth |
 | `GET /auth/google/callback` | Google OAuth callback |
 | `GET /auth/oidc/login` | Initiate generic OIDC OAuth (Okta, Auth0, Azure AD, Keycloak, etc.) |
 | `GET /auth/oidc/callback` | Generic OIDC OAuth callback |
-| `GET /auth/logout` | Logout (clears session) |
+| `GET /auth/logout` | Logout (clears session). Optional `?redirect=` follows the same relative-path rules as the login `redirect` parameter; otherwise redirects to `FRONTEND_URL`. |
+| `GET /auth/cli/authorize` | CLI login. Requires a web session for an active account (a missing, expired or inactive session redirects to `/login`), then creates or replaces an API key named by `name` and redirects to the localhost `callback` URL with `?key=`. Read-only identities, and users outside `ALLOWED_EMAIL_DOMAINS`, are redirected to `/login?error=access_denied` with no key. Non-localhost callbacks get `400`. |
 
 All three login endpoints use **OAuth 2.0 PKCE (S256)**: the login handler generates a `code_verifier` (32 random bytes, base64url) stored in an HttpOnly `oauth_verifier` cookie (alongside `oauth_state`, `MaxAge` 300), and sends `code_challenge=base64url(SHA256(verifier))` + `code_challenge_method=S256` on the authorize URL. The callback reads + clears the single-use verifier cookie (rejecting with `400` if absent, same shape as an invalid `state`) and includes `code_verifier` in the token-exchange POST. No client action required.
 
@@ -1057,7 +1153,7 @@ The login endpoints accept optional query parameters to support share link flows
 
 | Parameter | Description |
 |-----------|-------------|
-| `redirect` | URL path to redirect to after successful login |
+| `redirect` | Relative URL path to redirect to after successful login (after any pending CLI flow). `/auth…` paths stay backend paths; anything else gets `FRONTEND_URL` prepended. Absolute, protocol-relative (`//`), backslash or control-character values are ignored. |
 | `email` | Expected email address (for share link login hints) |
 
 When `email` is provided:
@@ -1074,6 +1170,21 @@ When `email` is provided:
 | `POST /auth/device/token` | Poll for access token |
 | `GET /auth/device` | User verification page |
 | `POST /auth/device/verify` | Submit user code |
+
+`/auth/device/code` and `/auth/device/token` responses (including errors) carry `Cache-Control: no-store`.
+
+`POST /auth/device/token` (body `{"device_code": "..."}`) responses:
+
+| Status | Body | When |
+|--------|------|------|
+| 200 | `{"access_token": "cfb_...", "token_type": "Bearer"}` | Code authorized; the code is consumed and the key issued in one transaction |
+| 400 | `{"error": "authorization_pending"}` | Code not yet authorized; keep polling |
+| 400 | `{"error": "expired_token"}` | Code expired |
+| 400 | `{"error": "invalid_grant"}` | Unknown code, or already exchanged (a code is single-use: of several concurrent polls exactly one gets the 200, the rest get `invalid_grant`) |
+| 400 | `{"error": "invalid_request"}` | Malformed body or empty `device_code` |
+| 403 | `{"error": "access_denied"}` | The authorizing user is no longer eligible: deactivated, made read-only, deleted, or outside `ALLOWED_EMAIL_DOMAINS` (rechecked at poll time). The code is deleted, so further polls get `invalid_grant` |
+| 409 | `{"error": "api_key_limit_exceeded"}` | User is at the API key limit; the code is **not** consumed, so it can be retried until it expires |
+| 500 | `{"error": "server_error"}` | Internal error |
 
 ---
 
@@ -1120,7 +1231,8 @@ POST /api/v1/admin/users
 ```
 **Request:** `{ "email": "new@example.com", "password": "securepass123" }`
 **Response:** `{ "id": 2, "email": "new@example.com" }`
-**Errors:** 400 (validation), 409 (duplicate email)
+**Validation:** `password` must be 8–72 bytes (bytes, not characters; 72 is bcrypt's input limit). Over-long passwords are rejected, never truncated.
+**Errors:** 400 (validation, e.g. `"Password must be at least 8 characters"` or `"Password must be at most 72 bytes"`; no user is created), 409 (duplicate email)
 
 ### Deactivate User
 ```
@@ -1306,14 +1418,15 @@ Triggers bulk regeneration of all smart recaps. Writes a timestamp to `admin_set
 POST /api/v1/admin/cards/invalidate
 ```
 
-Deletes `session_card_*` rows for sessions in a date window so the precompute worker recomputes them with current logic/pricing on the next tick (CF-343). Writes one audit row per affected session to `admin_card_invalidations`; the row also acts as a per-session smart-recap quota bypass signal.
+Deletes `session_card_*` rows for sessions in a date window so the precompute worker recomputes them with current logic/pricing on the next tick (CF-343), and/or queues a **session title recompute** (the `session_title` target, nbrd). Writes one audit row per affected session to `admin_card_invalidations` (`card_types` exactly as submitted); a row whose `card_types` includes `session_card_smart_recap` also acts as a per-session smart-recap quota bypass signal (`session_title` never does).
 
 **Request:**
 ```json
 {
   "start_date": "2026-04-01T00:00:00Z",
   "end_date": "2026-04-20T23:59:59Z",
-  "card_types": ["session_card_tokens"],
+  "card_types": ["session_card_tokens", "session_card_tokens_v2"],
+  "providers": ["claude-code"],
   "reason": "Opus 4.7 pricing backfill",
   "dry_run": false,
   "confirm": "1234"
@@ -1324,7 +1437,8 @@ Deletes `session_card_*` rows for sessions in a date window so the precompute wo
 |-------|------|-------------|
 | `start_date` | string | Required. ISO-8601 with explicit timezone (`Z` or `±hh:mm`). Filter: `sessions.last_message_at >= start_date`. |
 | `end_date` | string | Optional. Same format as `start_date`. Filter: `last_message_at < end_date`. Must be after `start_date`. |
-| `card_types` | string[] | Required, non-empty. Each entry must be one of: `session_card_tokens`, `session_card_session`, `session_card_tools`, `session_card_code_activity`, `session_card_conversation`, `session_card_agents_and_skills`, `session_card_redactions`, `session_card_workflows`, `session_card_smart_recap`. |
+| `card_types` | string[] | Required, non-empty. Each entry must be one of: `session_card_tokens`, `session_card_tokens_v2`, `session_card_session`, `session_card_tools`, `session_card_code_activity`, `session_card_conversation`, `session_card_agents_and_skills`, `session_card_redactions`, `session_card_workflows`, `session_card_smart_recap`, `session_title` (see below). Unknown values → `400 unknown card_type: X`. |
+| `providers` | string[] | Optional. Canonical providers (`claude-code`, `codex`, `opencode`, `cursor`) to scope **every** selected target to; legacy `session_type` aliases (e.g. `Claude Code`) are matched server-side. Omitted or empty = all providers. Non-canonical values → `400 unknown provider: X`. |
 | `reason` | string | Required, 1–500 chars. Stored in the audit row. |
 | `dry_run` | bool | Defaults to `true`. `false` to actually delete. |
 | `confirm` | string | Required on execute (`dry_run: false`) — a typed-confirmation echo (kyrr) of the affected-session count. The server **re-counts** affected sessions at execute time and rejects with `400` unless `confirm` equals that fresh count, binding the action to the current blast radius (a stale preview is rejected too). Ignored on dry-run. |
@@ -1344,9 +1458,30 @@ Deletes `session_card_*` rows for sessions in a date window so the precompute wo
 | Field | Type | Description |
 |-------|------|-------------|
 | `correlation_id` | string | UUID grouping all writes from this run (shared across batches). Generated for dry-run too so the UI can stitch preview → execute. |
-| `affected_sessions` | int | `COUNT(DISTINCT s.id)` where the session has at least one row in any selected card table (intersection semantic). |
+| `affected_sessions` | int | `COUNT(DISTINCT s.id)` over the window and `providers` filter, where the session has at least one row in any selected card table **or** (when `session_title` is selected) is a title candidate — the union across targets. `confirm` must echo this number. |
 | `affected_cards[<table>]` | int | Per-table count of rows that would be / were deleted. |
+| `affected_cards["session_title"]` | int | Present when `session_title` is selected: the number of title candidates that would be / were marked. |
 | `executed` | bool | `false` for dry-run; `true` for actual execute. |
+
+**`session_title` target (nbrd).** Selecting it marks each *title candidate* in the window (sets `sessions.title_recompute_requested_at`); nothing is recomputed in the request. A title candidate is a **Codex** session with `first_user_message IS NULL`, or a **Cursor** session whose `first_user_message` still contains `<user_query>`. The precompute worker (bucket 4) then repairs each marked session from data already stored — stored objects are only read, never modified — and clears the mark:
+
+- **Codex (fill-NULL only):** reads the main transcript's chunk 1 and derives the first human prompt exactly as sync ingest does (`event_msg` stream only, clamped to 8192 bytes). A session that gained a title in the meantime is left untouched; nothing derivable leaves the column `NULL` (never `""`).
+- **Cursor (envelope-only):** unwraps the stored `<user_query>` envelope. An empty envelope is left as-is so the session stays listable; clean values are untouched.
+
+Dry-run counts candidates from the database only; it does not predict per-session outcomes. The worker logs one line per session (`outcome`: `fixed` / `not_fixable` / `already_set` / `superseded`). A filled title makes a previously hidden Codex session listable and counted by Trends / cost-by-model immediately (both compute live); precomputed cards are **not** recomputed by this target — select the card types too.
+
+Example — repair the Codex 0.149.1 title regression and its cards in one run:
+```json
+{
+  "start_date": "2026-08-20T00:00:00Z",
+  "card_types": ["session_card_code_activity", "session_card_tools", "session_card_redactions", "session_card_smart_recap", "session_title"],
+  "providers": ["codex"],
+  "reason": "Codex 0.149.1 wire-format regression",
+  "dry_run": true
+}
+```
+
+Run this before enabling any session retention that could delete the transcripts it reads.
 
 **Partial-failure response (500):** the body includes `completed_batches` and `affected_sessions_executed` reporting progress before the failure, plus an `error` string. Already-committed batches remain invalidated; re-running the same window is safe.
 
@@ -1391,7 +1526,7 @@ Returns up to 500 most recent audit rows (ordered by `invalidated_at DESC`). Pas
 GET /api/v1/admin/cards/types
 ```
 
-Returns the canonical list of invalidatable card table names — the single source of truth (`analytics.AllCardTableNames`) that drives the admin invalidation UI's checkboxes. The frontend renders the list verbatim so it can never drift; `POST /api/v1/admin/cards/invalidate` validates inbound `card_types` against this same list and `400`s unknown values.
+Returns the canonical list of invalidation targets — every card table name plus `session_title` — the single source of truth (`analytics.AllInvalidationTargets`) that drives the admin invalidation UI's checkboxes. The frontend renders the list verbatim so it can never drift; `POST /api/v1/admin/cards/invalidate` validates inbound `card_types` against this same list and `400`s unknown values.
 
 **Response:**
 ```json
@@ -1406,7 +1541,8 @@ Returns the canonical list of invalidatable card table names — the single sour
     "session_card_agents_and_skills",
     "session_card_redactions",
     "session_card_workflows",
-    "session_card_smart_recap"
+    "session_card_smart_recap",
+    "session_title"
   ]
 }
 ```
@@ -1437,6 +1573,81 @@ Returns model families seen in stored session data whose family is absent from t
 ```
 
 An empty `models` array means every model family in stored session data is priced.
+
+**Auth:** super-admin only.
+
+---
+
+### List Precompute Failures
+```
+GET /api/v1/admin/precompute-failures
+```
+
+Returns every (session, bucket) the background worker has quarantined after `5` consecutive failed precompute attempts in that bucket (6kbe). A quarantined session is excluded from that bucket's stale-session query, so it stops using worker cycles and `WORKER_MAX_SESSIONS` slots. An attempt that crashes the worker process counts as a failure (`last_error` is then `worker exited during attempt`); a smart-recap quota skip or a shutdown does not. `bucket` is one of `regular_cards`, `smart_recap`, `search_index`, `session_title`. `provider` is the canonical session provider. `last_error` is the most recent error, truncated to 1 KB. Rows are ordered by `quarantined_at` descending.
+
+**Response:**
+```json
+{
+  "failures": [
+    {
+      "session_id": "2a6f42e3-0000-4000-8000-000000000001",
+      "user_id": 1,
+      "external_id": "019e3bb1-e75b-7423-b373-f8b8d573b237",
+      "provider": "codex",
+      "bucket": "regular_cards",
+      "attempts": 5,
+      "last_error": "parse rollout: token too long",
+      "quarantined_at": "2026-10-19T12:00:00Z"
+    }
+  ]
+}
+```
+
+An empty `failures` array means nothing is quarantined.
+
+**Auth:** super-admin only.
+
+---
+
+### Release a Precompute Failure
+```
+POST /api/v1/admin/precompute-failures/release
+```
+
+Releases one quarantine: deletes the (session, bucket) row so the worker retries the session on its next cycle with a fresh attempt count. Releasing a row that is not quarantined is a no-op (`released: 0`). Logged as an `ADMIN_AUDIT` line with action `precompute.release`.
+
+A successful on-view compute releases the matching quarantine too: `GET /api/v1/sessions/{id}/analytics` clears `regular_cards` after it computes and stores cards, and `smart_recap` after it generates a recap.
+
+**Request:**
+```json
+{
+  "session_id": "2a6f42e3-0000-4000-8000-000000000001",
+  "bucket": "regular_cards"
+}
+```
+
+**Response:**
+```json
+{ "released": 1 }
+```
+
+**Errors:** `400` if the body is not JSON, `session_id` is not a UUID, or `bucket` is not one of the four buckets.
+
+**Auth:** super-admin only.
+
+---
+
+### Release All Precompute Failures
+```
+POST /api/v1/admin/precompute-failures/release-all
+```
+
+Releases every quarantine at once, for recovery after an outage (storage, database or LLM down for longer than about five worker cycles) quarantined many sessions. Rows still counting toward quarantine are kept. No request body. Logged as an `ADMIN_AUDIT` line with action `precompute.release_all` and the `released` count.
+
+**Response:**
+```json
+{ "released": 12 }
+```
 
 **Auth:** super-admin only.
 
@@ -1479,7 +1690,9 @@ Returns the list of enabled authentication providers. No authentication required
   "features": {
     "shares_enabled": true,
     "saas_footer_enabled": false,
-    "saas_termly_enabled": false,
+    "org_analytics_enabled": false,
+    "password_auth_enabled": true,
+    "smart_recap_enabled": false,
     "support_email": "support@example.com"
   },
   "version": {
@@ -1501,9 +1714,9 @@ Returns the list of enabled authentication providers. No authentication required
 | `providers[].login_url` | string | Path to initiate login with this provider |
 | `features.shares_enabled` | bool | Whether share creation is enabled (`true` when `ENABLE_SHARE_CREATION=true`) |
 | `features.saas_footer_enabled` | bool | Whether the SaaS footer is shown (`true` when `ENABLE_SAAS_FOOTER=true`) |
-| `features.saas_termly_enabled` | bool | Whether Termly cookie consent is enabled (`true` when `ENABLE_SAAS_TERMLY=true`) |
 | `features.org_analytics_enabled` | bool | Whether org-wide analytics is enabled (`true` when `ENABLE_ORG_ANALYTICS=true`). See [Organization Analytics](#organization-analytics) for privacy implications |
 | `features.password_auth_enabled` | bool | Whether password-based authentication is enabled |
+| `features.smart_recap_enabled` | bool | Whether smart recap generation is active (`true` when `SMART_RECAP_ENABLED=true`) |
 | `features.support_email` | string | Support contact email address (from `SUPPORT_EMAIL` env var, defaults to `"support@example.com"`) |
 | `version.current` | string | Running backend build tag (e.g., `"v0.4.1"`). Empty in local dev (`go run` without ldflags). |
 | `version.latest` | string | Latest stable release tag on GitHub. Omitted when the check is disabled or the GitHub fetch failed. |
@@ -1602,7 +1815,7 @@ Returns the effective per-million-token model price table. No authentication req
 |-------|------|-------------|
 | `schema_version` | int | Document format version (currently `0`). A reader rejects a version higher than it understands and falls back to its embedded table. |
 | `updated_at` | string (RFC 3339) | When the price data was last changed. Drives "freshest-wins": a self-hosted backend adopts a remote table only when it is strictly newer than its embedded copy. |
-| `pricing` | object | Provider (`claude-code` / `codex`) → model family → rates. Rates are USD per million tokens. `cacheWrite` is the 5-minute cache-creation rate (1.25x input for Claude); `cacheWrite1h` is the 1-hour rate (2x input). When `cacheWrite1h` is absent or `0`, 1-hour cache tokens fall back to the `cacheWrite` rate (so older/remote docs never bill them at $0). OpenAI cache writes are free (`cacheWrite: 0`, `cacheWrite1h: 0`); the cached-input rate is `cacheRead`. |
+| `pricing` | object | Provider (`claude-code` / `codex`) → model family → rates. Rates are USD per million tokens. `cacheWrite` is the 5-minute cache-creation rate (1.25x input for Claude); `cacheWrite1h` is the 1-hour rate (2x input). When `cacheWrite1h` is absent or `0`, 1-hour cache tokens fall back to the `cacheWrite` rate (so older/remote docs never bill them at $0). OpenAI rows always carry `cacheWrite1h: 0` (no 1-hour tier) and put the cached-input rate in `cacheRead`; their `cacheWrite` is non-zero on the families that publish one (1.25x short-context input on the 5.6 and 6 families) and `0` on those that don't. |
 
 **Caching:** sent with `Cache-Control: public, max-age=<refresh-interval>` (default 7200s) — a tiny, edge-cacheable payload. The serving backend refreshes its own table from `PRICING_SOURCE_URL` lazily (2h on success, 15m on failure) and always returns a valid table (its embedded floor at worst). See [`internal/pricingsource`](internal/pricingsource/) for details.
 
@@ -1614,6 +1827,8 @@ Returns the effective per-million-token model price table. No authentication req
 |----------|-------------|
 | `GET /health` | Health check. Response: `{"status": "ok"}` |
 | `GET /help/delete-account` | Account deletion help page |
+| `GET /install` | `301` redirect to the CLI install script (`https://raw.githubusercontent.com/ConfabulousDev/confab/main/install.sh`) |
+| `GET /` | API info: `{"service": "confab-backend", "version": "v1"}`. Registered only when `STATIC_FILES_DIR` is unset; otherwise the frontend is served. |
 
 ---
 
@@ -1647,6 +1862,7 @@ Common HTTP status codes:
 | Upload endpoints | 2.78 req/sec (10k/hour) | 2000 |
 | Validation | 0.5 req/sec | 10 |
 | External API | 30 req/sec | 60 |
+| Client error reports | 0.5 req/sec | 5 |
 
 Upload rate limiting is per-user (not per-IP) to support backfill scenarios.
 External API rate limiting is per-user (keyed by authenticated user ID).
@@ -1663,9 +1879,10 @@ When `ALLOWED_EMAIL_DOMAINS` is set (comma-separated list of domains), only user
 | Password login | Redirect to `/login?error=Your email domain is not permitted...` |
 | API key requests | `403 Forbidden` with body `"Email domain not permitted"` |
 | Session-authenticated requests | `403 Forbidden` with body `"Email domain not permitted"` |
+| CLI authorize (`/auth/cli/authorize`) | Redirect to `/login?error=access_denied&error_description=Your email domain is not permitted...` (session cookie cleared, no key minted) |
 | Device code verification | `403 Forbidden` with HTML error `"Your email domain is not permitted"` |
 | Device code token exchange | `403 Forbidden` with JSON `{"error": "access_denied"}` |
-| Optional auth endpoints (session detail, analytics, sync file) | `401 Unauthorized` with `"Authentication required"` (anonymous access blocked) |
+| Optional auth endpoints (session detail, analytics, sync file, GitHub links list) | `401 Unauthorized` with `"Authentication required"` (anonymous access blocked) |
 | Admin user creation | Redirect with error `"Email domain not permitted"` |
 
 **Behavior:**

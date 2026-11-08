@@ -1,6 +1,6 @@
 # anthropic
 
-HTTP client for the Anthropic Messages API with OpenTelemetry tracing.
+HTTP client for the Anthropic Messages API.
 
 ## Files
 
@@ -13,7 +13,9 @@ HTTP client for the Anthropic Messages API with OpenTelemetry tracing.
 ## Key Types
 
 - **`Client`** -- HTTP client holding API key, base URL, and `*http.Client`. Created via `NewClient`.
-- **`MessagesRequest`** -- Request payload: model, max tokens, optional temperature, system prompt, and messages.
+- **`MessagesRequest`** -- Request payload: model, max tokens, optional temperature, system prompt, messages, optional `Thinking`, and optional `OutputConfig`. Optional fields are omitted from the JSON when unset.
+- **`ThinkingConfig`** -- Extended-thinking control (`thinking`), e.g. `Type: "disabled"`.
+- **`OutputConfig`** / **`OutputFormat`** -- Structured outputs (`output_config.format`): `Type: "json_schema"` plus a raw JSON Schema.
 - **`Message`** -- A single conversation turn with `Role` and `Content`.
 - **`MessagesResponse`** -- Full API response including content blocks, stop reason, and token usage.
 - **`Usage`** -- Token counts: input, output, cache creation, and cache read.
@@ -34,11 +36,10 @@ HTTP client for the Anthropic Messages API with OpenTelemetry tracing.
 
 1. Add the field to `MessagesRequest` in `messages.go` with the appropriate JSON tag.
 2. If the response shape changes, update `MessagesResponse` or `ContentBlock` accordingly.
-3. Add OpenTelemetry attributes in `CreateMessage` if the parameter is worth tracing.
 
 ## Invariants
 
-- **All API calls are traced.** `CreateMessage` creates an OpenTelemetry span with model, max tokens, status code, and token usage attributes. Errors are recorded on the span.
+- **This package does no logging.** Every failure path returns a wrapped error; the caller decides what to record. Token usage and generation time are persisted by the caller on the smart-recap card.
 - **API errors are structured.** HTTP 4xx/5xx responses are parsed into `*APIError` with status code, error type, and message. Callers can type-assert to get details.
 - **API version is pinned.** The `anthropic-version` header is set to `2023-06-01` for all requests.
 
@@ -58,6 +59,4 @@ Tests use `WithBaseURL` to point the client at an `httptest.Server` that returns
 
 ## Dependencies
 
-**Uses:** `go.opentelemetry.io/otel` (tracing)
-
-**Used by:** `internal/analytics` (smart recap generation)
+**Used by:** `internal/analytics` — the `anthropicRecapLLM` adapter in `smart_recap_llm.go`, selected when `SMART_RECAP_LLM_PROVIDER` is `anthropic` (the default). The adapter owns the smart-recap request shape (structured-output schema, thinking disabled); this package stays a generic client.

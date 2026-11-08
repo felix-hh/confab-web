@@ -15,6 +15,12 @@ import { computeSessionMeta } from '@/utils/sessionMeta';
 import type { TokenUsage } from '@/utils/tokenStats';
 import type { TranscriptLine, UserMessage, AssistantMessage } from '@/types';
 import { claudeAdapter } from './claudeAdapter';
+import {
+  agentToolUse,
+  asyncAgentResult,
+  syncAgentResult,
+  taskNotificationMessage,
+} from '@/test-fixtures/claudeSubagent';
 
 vi.mock('@/services/claudeTranscriptService', () => ({
   fetchParsedClaudeTranscript: vi.fn(),
@@ -140,13 +146,11 @@ describe('claudeAdapter', () => {
     vi.mocked(fetchParsedClaudeTranscript).mockResolvedValue({
       sessionId: 's',
       messages,
-      agents: [],
       validationErrors: [],
       totalLines: 1,
       metadata: {
         version: '1.0',
         messageCount: 1,
-        agentCount: 0,
         parseErrorCount: 0,
       },
     });
@@ -232,7 +236,7 @@ describe('claudeAdapter', () => {
   });
 });
 
-// CF-418: Claude adapter applies the fast-mode multiplier (6x) and adds
+// CF-418: Claude adapter applies the fast-mode multiplier (2x) and adds
 // per-request web-search dollars on top of the base arithmetic from
 // `calculateCost`. Both adjustments are Claude-specific.
 describe('claudeAdapter.calculateMessageCost', () => {
@@ -247,15 +251,15 @@ describe('claudeAdapter.calculateMessageCost', () => {
       .toBeCloseTo(0.45, 4);
   });
 
-  it('applies the 6x fast multiplier when usage.speed === "fast"', () => {
+  it('applies the 2x fast multiplier when usage.speed === "fast"', () => {
     const msg = assistantMessageWithUsage(
       'claude-opus-4-6-20260201',
       { ...zeroUsage(), input: 1_000_000, output: 100_000 },
       { speed: 'fast' },
     );
-    // opus-4-6: $5 + $2.50 = $7.50 base → $45 with 6x fast
+    // opus-4-6: $5 + $2.50 = $7.50 base → $15 with 2x fast
     expect(claudeAdapter.calculateMessageCost(msg.message.model, msg.tokenUsage, msg))
-      .toBeCloseTo(45, 4);
+      .toBeCloseTo(15, 4);
   });
 
   it('adds web-search dollars per request, not multiplied by fast', () => {
@@ -264,7 +268,7 @@ describe('claudeAdapter.calculateMessageCost', () => {
       zeroUsage(),
       { speed: 'fast', server_tool_use: { web_search_requests: 10 } },
     );
-    // Token cost = 0; web search = 10 * $0.01 = $0.10. Not multiplied by 6.
+    // Token cost = 0; web search = 10 * $0.01 = $0.10. Not multiplied by the fast rate.
     expect(claudeAdapter.calculateMessageCost(msg.message.model, msg.tokenUsage, msg))
       .toBeCloseTo(0.1, 4);
   });
@@ -275,9 +279,9 @@ describe('claudeAdapter.calculateMessageCost', () => {
       { ...zeroUsage(), input: 100_000, output: 10_000 },
       { speed: 'fast', server_tool_use: { web_search_requests: 2 } },
     );
-    // base = 100k*$5 + 10k*$25 = $0.75; fast = $4.50; web = $0.02 → $4.52
+    // base = 100k*$5 + 10k*$25 = $0.75; fast = $1.50; web = $0.02 → $1.52
     expect(claudeAdapter.calculateMessageCost(msg.message.model, msg.tokenUsage, msg))
-      .toBeCloseTo(4.52, 4);
+      .toBeCloseTo(1.52, 4);
   });
 });
 
@@ -290,7 +294,7 @@ describe('claudeAdapter.extendCostTooltip', () => {
     const msg = assistantMessageWithUsage('claude-sonnet-4-20250514', zeroUsage(), { speed: 'fast' });
     const out = claudeAdapter.extendCostTooltip!(baseLines, zeroUsage(), msg);
     expect(out.some((l) => /Speed:\s*fast/.test(l))).toBe(true);
-    expect(out.some((l) => l.includes('6x'))).toBe(true);
+    expect(out.some((l) => l.includes('2x'))).toBe(true);
   });
 
   it('appends Cache write / Cache read lines when present in canonical usage', () => {
@@ -329,6 +333,140 @@ describe('claudeAdapter.extendCostTooltip', () => {
   });
 });
 
+// et0r: optional `threads` capability — subagent transcripts as subtabs.
+describe('claudeAdapter.threads', () => {
+  it('discovers subagent threads in launch order with file name, parent and launch row', () => {
+    const items: TranscriptLine[] = [
+      agentToolUse({ uuid: 'u1', toolUseId: 't1', description: 'Explore' }),
+      asyncAgentResult({ uuid: 'r1', toolUseId: 't1', agentId: 'a1', description: 'Explore' }),
+      agentToolUse({ uuid: 'u2', toolUseId: 't2', description: 'Write tests' }),
+      asyncAgentResult({ uuid: 'r2', toolUseId: 't2', agentId: 'a2', description: 'Write tests' }),
+    ];
+    expect(claudeAdapter.threads?.discover(items, null)).toEqual([
+      {
+        id: 'a1',
+        fileName: 'agent-a1.jsonl',
+        label: 'Explore',
+        parentThreadId: null,
+        launchTargetId: 'r1',
+        status: 'running',
+        model: 'claude-opus-5',
+      },
+      {
+        id: 'a2',
+        fileName: 'agent-a2.jsonl',
+        label: 'Write tests',
+        parentThreadId: null,
+        launchTargetId: 'r2',
+        status: 'running',
+        model: 'claude-opus-5',
+      },
+    ]);
+  });
+
+  // we3k: provider-agnostic display fields for the thread strip.
+  it('fills normalized status, agent type, model and duration display fields', () => {
+    const items: TranscriptLine[] = [
+      agentToolUse({ uuid: 'u1', toolUseId: 't1', description: 'Find callers', subagentType: 'Explore', model: 'claude-haiku-4-5' }),
+      syncAgentResult({ uuid: 'r1', toolUseId: 't1', agentId: 'a1', totalDurationMs: 90_000 }),
+      agentToolUse({ uuid: 'u2', toolUseId: 't2', description: 'Broken' }),
+      syncAgentResult({ uuid: 'r2', toolUseId: 't2', agentId: 'a2', isError: true }),
+      agentToolUse({ uuid: 'u3', toolUseId: 't3', description: 'Background' }),
+      asyncAgentResult({ uuid: 'r3', toolUseId: 't3', agentId: 'a3', description: 'Background' }),
+      taskNotificationMessage('n3', { taskId: 'a3', toolUseId: 't3', status: 'killed' }),
+    ];
+    const refs = claudeAdapter.threads?.discover(items, null) ?? [];
+    expect(refs[0]).toMatchObject({ status: 'completed', subtitle: 'Explore', model: 'claude-haiku-4-5', durationMs: 90_000 });
+    expect(refs[1]).toMatchObject({ status: 'failed' });
+    expect(refs[2]).toMatchObject({ status: 'stopped', model: 'claude-opus-5' });
+  });
+
+  it('flips a running agent to completed once its notification lands', () => {
+    const launched: TranscriptLine[] = [
+      agentToolUse({ uuid: 'u1', toolUseId: 't1', description: 'Background' }),
+      asyncAgentResult({ uuid: 'r1', toolUseId: 't1', agentId: 'a1', description: 'Background' }),
+    ];
+    expect(claudeAdapter.threads?.discover(launched, null)[0]?.status).toBe('running');
+    const finished = [...launched, taskNotificationMessage('n1', { taskId: 'a1', toolUseId: 't1' })];
+    expect(claudeAdapter.threads?.discover(finished, null)[0]?.status).toBe('completed');
+  });
+
+  it('records the parent thread id for agents discovered inside a subagent stream', () => {
+    const items: TranscriptLine[] = [
+      agentToolUse({ uuid: 's1', toolUseId: 'tn', description: 'Nested', agentId: 'a1' }),
+      asyncAgentResult({ uuid: 's2', toolUseId: 'tn', agentId: 'child', description: 'Nested' }),
+    ];
+    expect(claudeAdapter.threads?.discover(items, 'a1')[0]?.parentThreadId).toBe('a1');
+  });
+
+  it('labels fall back from description to subagent_type to agent id', () => {
+    const items: TranscriptLine[] = [
+      agentToolUse({ uuid: 'u1', toolUseId: 't1', subagentType: 'Explore' }),
+      syncAgentResult({ uuid: 'r1', toolUseId: 't1', agentId: 'a1' }),
+      agentToolUse({ uuid: 'u2', toolUseId: 't2' }),
+      syncAgentResult({ uuid: 'r2', toolUseId: 't2', agentId: 'a2' }),
+    ];
+    expect(claudeAdapter.threads?.discover(items, null).map((t) => t.label)).toEqual(['Explore', 'a2']);
+  });
+
+  it('dedups duplicate labels with a (2), (3) suffix', () => {
+    const items: TranscriptLine[] = [
+      agentToolUse({ uuid: 'u1', toolUseId: 't1', description: 'Review' }),
+      asyncAgentResult({ uuid: 'r1', toolUseId: 't1', agentId: 'a1', description: 'Review' }),
+      agentToolUse({ uuid: 'u2', toolUseId: 't2', description: 'Review' }),
+      asyncAgentResult({ uuid: 'r2', toolUseId: 't2', agentId: 'a2', description: 'Review' }),
+      agentToolUse({ uuid: 'u3', toolUseId: 't3', description: 'Review' }),
+      asyncAgentResult({ uuid: 'r3', toolUseId: 't3', agentId: 'a3', description: 'Review' }),
+    ];
+    expect(claudeAdapter.threads?.discover(items, null).map((t) => t.label)).toEqual([
+      'Review',
+      'Review (2)',
+      'Review (3)',
+    ]);
+  });
+
+  it('returns no threads for a stream without Agent calls', () => {
+    expect(claudeAdapter.threads?.discover([userMessage('u1', '2026-05-13T01:00:00Z')], null)).toEqual([]);
+  });
+
+  it('builds the thread file name for an arbitrary (deep-linked) thread id', () => {
+    expect(claudeAdapter.threads?.fileNameFor('zz')).toBe('agent-zz.jsonl');
+  });
+
+  // jgk8 D7: the All-subagents total counts every classic subagent file.
+  describe('countThreadFiles', () => {
+    function file(file_name: string, file_type: string) {
+      return { file_name, file_type, last_synced_line: 1, updated_at: '2026-09-30T00:00:00Z' };
+    }
+
+    it('counts every flat agent file, at any spawn depth', () => {
+      const files = [
+        file('transcript.jsonl', 'transcript'),
+        file('agent-a05d3d182343d2ab7.jsonl', 'agent'),
+        file('agent-a7437088c9e3342e0.jsonl', 'agent'),
+        file('agent-af22b3c603bbfa454.jsonl', 'agent'),
+      ];
+      expect(claudeAdapter.threads?.countThreadFiles?.(files)).toBe(3);
+    });
+
+    it('excludes workflow-run agent files and non-agent files', () => {
+      const files = [
+        file('transcript.jsonl', 'transcript'),
+        file('agent-a1.jsonl', 'agent'),
+        file('subagents/workflows/run1/agent-w1.jsonl', 'agent'),
+        file('subagents/workflows/run1/journal.jsonl', 'agent'),
+        file('todo-a1.json', 'todo'),
+      ];
+      expect(claudeAdapter.threads?.countThreadFiles?.(files)).toBe(1);
+    });
+
+    it('is zero for a session without subagent files', () => {
+      expect(claudeAdapter.threads?.countThreadFiles?.([file('transcript.jsonl', 'transcript')])).toBe(0);
+      expect(claudeAdapter.threads?.countThreadFiles?.([])).toBe(0);
+    });
+  });
+});
+
 // CF-436: Per-provider tooltip strings for the Tokens summary card live on
 // the adapter as static fields. Claude defines both cost + fast tooltips.
 describe('claudeAdapter Tokens-card tooltips (CF-436)', () => {
@@ -338,9 +476,9 @@ describe('claudeAdapter Tokens-card tooltips (CF-436)', () => {
     );
   });
 
-  it('defines tokensFastTooltip naming Anthropic priority tier', () => {
+  it('defines tokensFastTooltip naming Anthropic fast mode', () => {
     expect(claudeAdapter.tokensFastTooltip).toBe(
-      'Cost from turns using Anthropic priority tier (~6x base rate)',
+      'Cost from turns using Anthropic fast mode (2x base rate; Opus 5 and Opus 4.8 only)',
     );
   });
 });

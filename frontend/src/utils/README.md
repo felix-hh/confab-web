@@ -6,7 +6,7 @@ Utility functions for formatting, computation, and data transformation. Pure fun
 
 | File | Role |
 |------|------|
-| `formatting.ts` | Date/time formatting, duration formatting, model name extraction, repo name formatting |
+| `formatting.ts` | Date/time formatting, duration formatting, model name extraction, repo name formatting, count pluralization |
 | `tokenStats.ts` | Token cost calculation, runtime pricing table (installed via `setPricingTable` from the backend), per-message cost computation |
 | `sessionMeta.ts` | Session duration and date computation from transcript timestamps |
 | `compactionStats.ts` | Compaction event counting, average compaction time, and response time formatting |
@@ -19,8 +19,8 @@ Utility functions for formatting, computation, and data transformation. Pure fun
 | `agentSkillChart.ts` | Shared agent/skill chart constants (`AGENT_SKILL_COLORS`) and the `ChartDataItem` shape |
 | `chartLabels.ts` | `truncateName` — cap long bar-chart axis labels to "prefix...suffix" form. `truncatedYAxisWidth(labels, minChars)` — px-width for a Recharts YAxis sized off the *truncated* form so one long MCP/agent name can't shove bars off-screen. Pairs with `TruncatedYAxisTick` (Agents & Skills, Tools) |
 | `utils.ts` | Low-level utilities: `stripAnsi`, `isRecord` (runtime guard for plain objects, used wherever an `unknown` needs its fields read without an `as` cast), `formatBytes` |
-| `markdown.ts` | `renderMarkdownToHtml` — GFM markdown to sanitized HTML via `marked` + `DOMPurify`. `tryParseAsJson` — if a string is a JSON object/array, return a pretty-printed version (used as the JSON fallback before markdown rendering). Used by `ContentBlock`, the Codex message renderers, `AwaySummary`, and `QueuedCommand` |
-| `providers.ts` | CF-416 — `PROVIDER_METADATA` registry (icon, label, brandDisplayName, brandColor, resumeCommand) keyed by `ProviderId` (`'claude-code' \| 'codex' \| 'opencode' \| 'cursor'`). `getProviderMetadata(id)` strict canonical lookup; `getProviderMetadataOrFallback(value, 'claude' \| 'neutral')` codifies the unknown-provider policy in one place. `isLegacyClaudeCode(value)` (CF-366) — documented seam mirroring backend `models.LegacyAliases`; returns true for non-canonical spellings whose normalized form is `'claude-code'`. `PROVIDER_VALUES`, `providerLabel(value)` preserved for back-compat with surfaces that render arbitrary backend values. Used by `providerIcon`, `SessionHeader`, `CopyIdDropdown`, `TrendsTopSessionsCard`, `FilterChipsBar`, `HomePage` |
+| `markdown.ts` | `renderMarkdownToHtml` — GFM markdown to sanitized HTML via `marked` + `DOMPurify` (global `marked` config with `breaks: true`, ANSI stripped; for transcripts). `renderLegalMarkdown` — the legal documents' renderer: its own `Marked` instance (GFM, no `breaks`), every heading gets a slug `id` from its text (duplicates `-2`, `-3`, …), output through `DOMPurify`; used by `LegalDocPage`. `tryParseAsJson` — if a string is a JSON object/array, return a pretty-printed version (used as the JSON fallback before markdown rendering). Used by `ContentBlock`, the Codex message renderers, `AwaySummary`, and `QueuedCommand` |
+| `providers.ts` | CF-416 — `PROVIDER_METADATA` registry (icon, label, brandDisplayName, brandColor, resumeCommand) keyed by `ProviderId` (`'claude-code' \| 'codex' \| 'opencode' \| 'cursor'`). `getProviderMetadata(id)` strict canonical lookup; `getProviderMetadataOrFallback(value, 'claude' \| 'neutral')` codifies the unknown-provider policy in one place. `PROVIDER_VALUES`, `providerLabel(value)` preserved for back-compat with surfaces that render arbitrary backend values. Used by `providerIcon`, `SessionHeader`, `CopyIdDropdown`, `TrendsTopSessionsCard`, `FilterChipsBar`, `HomePage` |
 | `externalLinks.ts` | CF-571 — canonical external URLs surfaced from inside the app: `DOCS_URL` (docs site) and `GITHUB_ISSUES_URL` (issue tracker). Point at the hosted project on every deployment, including self-hosted. CF-574 adds `buildGitHubIssueUrl(title, body, labels?)` — builds a prefilled `…/issues/new?title=&body=&labels=` URL via `URLSearchParams` (generic plumbing; the redaction layer lives in `reportUnknown.ts`). Used by `Header`, `Footer`, `SessionEmptyState`, `ErrorBoundary`, `LoginPage`, `ReportUnknownButton`. |
 | `reportUnknown.ts` | CF-574 — privacy-conscious "Report bug" plumbing for UNKNOWN transcript rows. `UnknownDescriptor` is a normalized fingerprint (`provider`, `surface`, `type`, optional `reason`, `keyFingerprint`) carrying key *names* and a type string, **never** payload values. `computeKeyFingerprint(obj)` lists top-level key names plus one nesting level (`parent.child`); arrays/non-objects contribute no index spam. `buildUnknownReportIssue(descriptor, appVersion?)` / `buildUnknownReportUrl(...)` render the prefilled issue (Confab version line only when non-empty; no label, no payload). Centralizes the redaction contract for all four unknown surfaces. |
 | `demoIdentity.ts` | CF-483 demo-mode helpers. `getDemoIdentity(): string \| null` defensively reads the backend-injected `window.__DEMO_IDENTITY__` global. `isDemoViewer(email): boolean` returns true when demo mode is on AND `email` matches the demo identity — used by `Header`, `HomePage`, `LoginPage` to branch UI for the read-only viewer (skip `?owner=` pre-filter, show "Log in as yourself", skip post-login redirect). `notifyReadOnlyDemo()` dispatches the `confab:read-only` CustomEvent that `ReadOnlyToast` listens for; called from `services/api.ts` when a request returns `{"error":"read_only_user"}`. `READ_ONLY_EVENT` is the documented event-name constant. |
@@ -40,6 +40,8 @@ Utility functions for formatting, computation, and data transformation. Pure fun
 | `formatModelName` | `(model: string) => string` | Technical format: "claude-sonnet-4.5" |
 | `formatModelDisplayName` | `(model: string) => string` | User-friendly label ("Opus 4.1", "GPT-5"). Handles full ids and bare tokens_v2 family keys; shared by Session + TokensV2 cards (mp4e) |
 | `formatRepoName` | `(repoUrl: string) => string` | Extract "user/repo" from full URL |
+| `formatCalendarDate` | `(isoDate: string) => string` | `YYYY-MM-DD` → "January 9, 2026", formatted in UTC so it never shifts a day |
+| `plural` | `(count: number, singular: string, pluralForm?: string) => string` | "1 edit" / "2 edits"; `pluralForm` (default `singular + 's'`) for irregular plurals. Shared by the transcript cards (SubagentCard, ArtifactTool, server-tool badges) |
 
 ### tokenStats.ts
 
@@ -67,8 +69,13 @@ families fall back to zero pricing with a warning.
 **Server tool pricing**: `WEB_SEARCH_COST_PER_REQUEST = $0.01`, applied by
 the Claude adapter's `calculateMessageCost`. Not multiplied by fast mode.
 
-**Fast mode**: `FAST_MODE_MULTIPLIER = 6` applied by the Claude adapter when
-`message.message.usage.speed === 'fast'`. Codex has no equivalent toggle.
+**Fast mode**: `FAST_MODE_MULTIPLIER = 2` applied by the Claude adapter when
+`message.message.usage.speed === 'fast'`. Anthropic publishes fast mode at
+$10/$50 per million against the $5/$25 standard rate on the models that offer
+it (Opus 5, Opus 4.8) — a flat 2x, with the caching multipliers stacking on top
+of the fast base price. Mirrors the backend's `fastModeMultiplier`
+(`analytics/pricing.go`); the two must move together. Codex has no equivalent
+toggle.
 
 ### sessionMeta.ts
 
@@ -119,7 +126,7 @@ the Claude adapter's `calculateMessageCost`. Not multiplied by fast mode.
 3. Add a `.test.ts` file with test cases
 
 ### Updating model pricing
-Edit the single source — `backend/internal/pricingsource/pricing.json` — and bump its `updated_at`. The frontend has no bundled table to update; it fetches the effective table from the backend at runtime. Look up current prices on the Anthropic pricing page or OpenAI's developer pricing page. For OpenAI entries set `cacheWrite: 0` and `cacheWrite1h: 0` (writes are free) and put the documented cached-input rate in `cacheRead`. For Claude entries set `cacheWrite1h` to 2x input (the 1-hour cache-write rate).
+Edit the single source — `backend/internal/pricingsource/pricing.json` — and bump its `updated_at`. The frontend has no bundled table to update; it fetches the effective table from the backend at runtime. Look up current prices on the Anthropic pricing page or OpenAI's developer pricing page. For OpenAI entries put the documented cached-input rate in `cacheRead` and leave `cacheWrite1h` at `0` (there is no 1-hour tier); `cacheWrite` takes the documented cache-write rate — 1.25x short-context input on the 5.6 and 6 families, `0` on older families that publish none. For Claude entries set `cacheWrite1h` to 2x input (the 1-hour cache-write rate).
 
 ## Invariants / Conventions
 
@@ -138,6 +145,7 @@ Edit the single source — `backend/internal/pricingsource/pricing.json` — and
 ## Testing
 
 - `formatting.test.ts` -- Date/time formatting, duration formatting, model name extraction
+- `markdown.test.ts` -- `renderLegalMarkdown` heading ids, tables, no `<br>` on single newlines, sanitizing; `renderMarkdownToHtml` unaffected
 - `tokenStats.test.ts` -- Cost calculation, model family extraction, formatting
 - `sessionMeta.test.ts` -- Duration computation from messages, fallback behavior
 - `compactionStats.test.ts` -- Compaction event counting, average time calculation
@@ -151,5 +159,5 @@ Edit the single source — `backend/internal/pricingsource/pricing.json` — and
 ## Dependencies
 
 - `@/types` (type imports for `TranscriptLine`, `AssistantMessage`, `GitInfo`)
-- `marked` (GFM markdown parser, used by `markdown.ts`)
+- `marked` (GFM markdown parser, used by `markdown.ts`; `renderLegalMarkdown` uses a separate `Marked` instance)
 - `dompurify` (HTML sanitization, used by `markdown.ts`)

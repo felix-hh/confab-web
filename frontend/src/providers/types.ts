@@ -50,13 +50,13 @@ import type {
 } from '@/components/session/cursorCategories';
 import type { CursorRawEntry } from '@/services/cursorTranscriptService';
 
-export interface FilterAPI<TFilterState, TToggles> {
+interface FilterAPI<TFilterState, TToggles> {
   state: TFilterState;
   setState: (state: TFilterState, opts?: { replace?: boolean }) => void;
   toggles: TToggles;
 }
 
-export interface TranscriptPaneProps<TItem> {
+interface TranscriptPaneProps<TItem> {
   sessionId: string;
   items: TItem[];
   filteredItems: TItem[];
@@ -73,6 +73,57 @@ export interface TranscriptPaneProps<TItem> {
    *  panes ignore them (they carry real per-message times). */
   firstSeen?: string | null;
   lastSyncAt?: string | null;
+  /** et0r: the open subagent thread; null/undefined = Main. Only threads-capable panes read it. */
+  activeThreadId?: string | null;
+  /** et0r: switch to a thread. Present only when the adapter has `threads`. */
+  onOpenThread?: (threadId: string) => void;
+  /** et0r D7: the active thread's file isn't uploaded yet (404); the hook is retrying. */
+  notSynced?: boolean;
+}
+
+/** we3k: normalized thread status shown on thread-strip chips and dropdown rows. */
+export type TranscriptThreadStatus = 'running' | 'completed' | 'failed' | 'stopped' | 'unknown';
+
+/**
+ * et0r: one transcript thread (a subagent) rendered as a subtab under
+ * Transcript. Produced by an adapter's optional `threads` capability.
+ */
+export interface TranscriptThreadRef {
+  /** Provider thread id (Claude: agentId). */
+  id: string;
+  /** Session file holding the thread's transcript. */
+  fileName: string;
+  /** Tab label; duplicates are suffixed " (2)", " (3)". */
+  label: string;
+  /** null = launched from Main; undefined = unknown (e.g. a deep link). */
+  parentThreadId: string | null | undefined;
+  /** Id of the launching row in the parent thread ("Go to parent" lands here). */
+  launchTargetId?: string;
+  /** we3k display fields, all optional. Missing status renders as `unknown`. */
+  status?: TranscriptThreadStatus;
+  /** Secondary label (Claude: subagent type). */
+  subtitle?: string;
+  model?: string;
+  durationMs?: number;
+}
+
+interface TranscriptThreadsCapability<TItem> {
+  /** Threads launched from `items` (one thread's full item stream), in launch order. */
+  discover(items: TItem[], parentThreadId: string | null): TranscriptThreadRef[];
+  /** File name for a thread id not (yet) discovered — deep links. */
+  fileNameFor(threadId: string): string;
+  /**
+   * jgk8: how many threads the session's uploaded files hold, at any depth
+   * (the All-subagents total). Optional; without it the total is the count
+   * of threads Main launched.
+   */
+  countThreadFiles?(files: readonly SessionFileRef[]): number;
+}
+
+/** The parts of a session file (`SessionDetail.files[number]`) thread counting reads. */
+interface SessionFileRef {
+  file_name: string;
+  file_type: string;
 }
 
 export interface SessionMetaFallback {
@@ -165,6 +216,12 @@ export interface ProviderAdapter<TRaw, TItem, TFilterState, TToggles, TCounts> {
    * tier) defines this. CF-436.
    */
   readonly tokensFastTooltip?: string;
+
+  /**
+   * et0r: optional multi-thread transcripts (subagents as subtabs). Only
+   * Claude implements it today; SessionViewer renders no strip without it.
+   */
+  readonly threads?: TranscriptThreadsCapability<TItem>;
 
   FilterDropdown: FC<{
     counts: TCounts;

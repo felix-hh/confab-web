@@ -9,6 +9,8 @@
 //   response_item           OpenAI Responses items (messages, function_call, ...)
 //   event_msg               UI events (user_message, agent_message, token_count, ...)
 //   compacted               context compaction replacement
+//   token_usage_record      aggregate per-response/turn/thread usage telemetry
+//   world_state             periodic environment/instructions/skills snapshot (zgd6)
 //   (anything else)         caught by UnknownCodexLineSchema for forward-compat
 //
 // `response_item` and `event_msg` carry a nested discriminator `payload.type`.
@@ -341,6 +343,105 @@ const CodexEventContextCompactedSchema = z
   })
   .passthrough();
 
+// pnkh: `event_msg.item_completed` is a lifecycle mirror emitted for every
+// item type (AgentMessage, UserMessage, Reasoning, CommandExecution,
+// FileChange, Extension, ...). Drop as noise — see handleEventMsg. `item` is
+// deliberately generic so future subtypes parse here instead of falling
+// through to the unknown catch-all.
+const CodexEventItemCompletedSchema = z
+  .object({
+    type: z.literal('item_completed'),
+    thread_id: z.string().optional(),
+    turn_id: z.string().optional(),
+    item: z.object({ type: z.string() }).passthrough(),
+    started_at_ms: z.number().optional(),
+    completed_at_ms: z.number().optional(),
+  })
+  .passthrough();
+
+// px58: `event_msg` payload types that openai/codex's own
+// `should_persist_event_msg` policy (rollout/src/policy.rs) says CAN reach a
+// rollout file — either always, or under the legacy history mode still present
+// in older on-disk sessions — but that were previously outside
+// KNOWN_EVENT_PAYLOAD_TYPES, so they surfaced as misleading "Unrecognized line"
+// CodexUnknownItem rows. Recognized here and then dropped silently; the
+// per-type drop rationale lives with each `case` in handleEventMsg. Only
+// `thread_settings_applied` has been observed in a real session so far; the
+// rest are declared defensively per Codex's source-level contract, not because
+// we've seen them fire — see px58 for the full audit.
+
+// px58: config snapshot for the thread (model, approval policy, sandbox,
+// collaboration mode, ...). The nested `thread_settings` struct is large and
+// volatile, so only `thread_id` is declared; `.passthrough()` keeps the rest.
+const CodexEventThreadSettingsAppliedSchema = z
+  .object({
+    type: z.literal('thread_settings_applied'),
+    thread_id: z.string().optional(),
+  })
+  .passthrough();
+
+// px58: thread-goal bookkeeping. No fields we read.
+const CodexEventThreadGoalUpdatedSchema = z
+  .object({
+    type: z.literal('thread_goal_updated'),
+  })
+  .passthrough();
+
+// px58: thread-rollback bookkeeping. No fields we read.
+const CodexEventThreadRolledBackSchema = z
+  .object({
+    type: z.literal('thread_rolled_back'),
+  })
+  .passthrough();
+
+// px58: legacy-history-mode mirror of `response_item.reasoning`, redundant with
+// the canonical response_item just like `user_message` / `agent_message` above.
+const CodexEventAgentReasoningSchema = z
+  .object({
+    type: z.literal('agent_reasoning'),
+  })
+  .passthrough();
+
+// px58: raw-content variant of the above.
+const CodexEventAgentReasoningRawContentSchema = z
+  .object({
+    type: z.literal('agent_reasoning_raw_content'),
+  })
+  .passthrough();
+
+// px58: subagent lifecycle telemetry. No fields we read; the parent-side
+// spawn_agent / wait_agent function_calls are the analytics source (see the
+// backend codex parser's SubagentSpawns).
+const CodexEventSubAgentActivitySchema = z
+  .object({
+    type: z.literal('sub_agent_activity'),
+  })
+  .passthrough();
+
+// px58: `entered_review_mode` / `exited_review_mode` — review-mode entry and
+// exit markers. No fields we read.
+const CodexEventEnteredReviewModeSchema = z
+  .object({
+    type: z.literal('entered_review_mode'),
+  })
+  .passthrough();
+
+const CodexEventExitedReviewModeSchema = z
+  .object({
+    type: z.literal('exited_review_mode'),
+  })
+  .passthrough();
+
+// px58: completion of an image-generation tool call. Its response_item sibling
+// `image_generation_call` is itself unhandled today (absent from
+// KNOWN_RESPONSE_ITEM_PAYLOAD_TYPES), so no callIdToDraft entry exists for this
+// event to enrich.
+const CodexEventImageGenerationEndSchema = z
+  .object({
+    type: z.literal('image_generation_end'),
+  })
+  .passthrough();
+
 // Catch-all for unknown event_msg.payload.type variants.
 const CodexUnknownEventPayloadSchema = z
   .object({ type: z.string() })
@@ -357,6 +458,16 @@ const KnownEventPayloadSchema = z.union([
   CodexEventWebSearchEndSchema,
   CodexEventTurnAbortedSchema,
   CodexEventContextCompactedSchema,
+  CodexEventItemCompletedSchema,
+  CodexEventThreadSettingsAppliedSchema,
+  CodexEventThreadGoalUpdatedSchema,
+  CodexEventThreadRolledBackSchema,
+  CodexEventAgentReasoningSchema,
+  CodexEventAgentReasoningRawContentSchema,
+  CodexEventSubAgentActivitySchema,
+  CodexEventEnteredReviewModeSchema,
+  CodexEventExitedReviewModeSchema,
+  CodexEventImageGenerationEndSchema,
 ]);
 
 const CodexEventPayloadSchema = z.union([
@@ -377,6 +488,17 @@ const KNOWN_EVENT_PAYLOAD_TYPES = new Set<string>([
   'web_search_end',      // CF-368
   'turn_aborted',        // CF-368
   'context_compacted',   // CF-368
+  'item_completed',      // pnkh
+  // px58 — recognized, then dropped silently (see the schemas above):
+  'thread_settings_applied',
+  'thread_goal_updated',
+  'thread_rolled_back',
+  'agent_reasoning',
+  'agent_reasoning_raw_content',
+  'sub_agent_activity',
+  'entered_review_mode',
+  'exited_review_mode',
+  'image_generation_end',
 ]);
 
 export function isKnownEventPayload(
@@ -458,6 +580,42 @@ const CodexCompactedLineSchema = z
   })
   .passthrough();
 
+// pnkh: top-level aggregate usage telemetry, distinct from the nested
+// `event_msg.token_count` that owns all usage attribution. Drop as noise —
+// see normalizeCodexLines. The payload's `usage`, `turn_token_usage` and
+// `thread_token_usage` counters are left undeclared on purpose: nothing reads
+// them, and declaring them would invite attaching them to a render item.
+const CodexTokenUsageRecordPayloadSchema = z
+  .object({
+    thread_id: z.string().optional(),
+    turn_id: z.string().optional(),
+    session_id: z.string().optional(),
+    response_id: z.string().optional(),
+  })
+  .passthrough();
+
+const CodexTokenUsageRecordLineSchema = z
+  .object({
+    timestamp: z.string(),
+    type: z.literal('token_usage_record'),
+    payload: CodexTokenUsageRecordPayloadSchema.optional(),
+  })
+  .passthrough();
+
+// zgd6: periodic environment/instructions/skills snapshot, dropped by
+// normalizeCodexLines — recognized here only so it doesn't fall through to
+// CodexUnknownLineSchema and render as an unrecognized line. The payload is
+// left unmodeled on purpose: nothing reads it here or in the backend (see
+// backend/internal/codex/README.md), and declaring fields would invite
+// attaching them to a render item.
+const CodexWorldStateLineSchema = z
+  .object({
+    timestamp: z.string(),
+    type: z.literal('world_state'),
+    payload: z.object({}).passthrough().optional(),
+  })
+  .passthrough();
+
 // Catch-all for unknown top-level types.
 const CodexUnknownLineSchema = z
   .object({
@@ -478,6 +636,8 @@ const KnownCodexLineSchema = z.union([
   CodexResponseItemLineSchema,
   CodexEventMsgLineSchema,
   CodexCompactedLineSchema,
+  CodexTokenUsageRecordLineSchema,
+  CodexWorldStateLineSchema,
 ]);
 
 export const RawCodexLineSchema = z.union([
@@ -494,11 +654,13 @@ const KNOWN_LINE_TYPES = new Set<string>([
   'response_item',
   'event_msg',
   'compacted',
+  'token_usage_record',
+  'world_state',
 ]);
 
 /**
  * Type predicate: narrows away the catch-all so a subsequent `switch`
- * on `line.type` discriminates cleanly between the 5 known branches.
+ * on `line.type` discriminates cleanly between the known branches.
  */
 export function isKnownCodexLine(line: RawCodexLine): line is KnownCodexLine {
   return KNOWN_LINE_TYPES.has(line.type);

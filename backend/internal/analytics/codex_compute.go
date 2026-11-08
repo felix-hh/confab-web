@@ -2,7 +2,6 @@ package analytics
 
 import (
 	"context"
-	"time"
 
 	"github.com/ConfabulousDev/confab-web/internal/codex"
 	"github.com/ConfabulousDev/confab-web/internal/logger"
@@ -18,7 +17,8 @@ import (
 // Per-card aggregation rules:
 //   - Tokens: sum across rollouts (cached is a subset of input under OpenAI
 //     semantics — subtract before applying the uncached rate; reasoning tokens
-//     fold into output; OpenAI doesn't charge for cache writes).
+//     fold into output; cache writes bill nothing because the wire carries no
+//     cache-write count, not because the rate is zero — md0z).
 //   - Session: per-turn counts sum; ModelsUsed unions; DurationMs spans
 //     earliest start to latest completion; compactions sum (all "auto").
 //   - Conversation: rollouts[0] only — turn counts + timing reflect
@@ -28,10 +28,16 @@ import (
 //     per-tool stats and excluded from TotalToolCalls / ToolErrorCount (CF-438).
 //     spawn_agent / wait_agent function_calls are routed out of Turn.ToolCalls
 //     by the parser (CF-443) so they only surface in the Agents & Skills card.
-//   - Code activity: per-rollout dispatch. apply_patch envelopes drive
-//     FilesModified / LinesAdded / Removed and LanguageBreakdown. FilesRead
-//     stays 0 (Codex has no Read tool). SearchCount stays 0 — web_search_call
-//     is web search, not file search (CF-439).
+//   - Code activity: per-rollout dispatch, reading whichever shape the
+//     rollout's CLI era emitted (m2ky). <=0.130.0 apply_patch envelopes and
+//     >=0.149.1 item_completed FileChange items both drive FilesModified /
+//     LinesAdded / Removed and LanguageBreakdown. FilesRead and SearchCount
+//     are era-dependent: >=0.149.1 populates them from Codex's own
+//     item.parsed_cmd classification ("read" / "search"), while <=0.130.0
+//     keeps zeros because exec_command records the command but nothing about
+//     its purpose. Web searches are excluded from SearchCount in both eras —
+//     that is web search, not file search, and it counts as a tool instead
+//     (CF-439).
 //   - Agents/skills: per-rollout dispatch (CF-443). SubagentSpawns bucket by
 //     agent_role (success = wait_agent "completed", error = any other status
 //     or orphan). SkillInvocations bucket by skill name, always success
@@ -53,10 +59,7 @@ func ComputeFromCodexRollout(ctx context.Context, rollouts []*codex.ParsedRollou
 	}
 
 	// Tokens and Session aggregate across all rollouts internally.
-	// Pass time.Time{} (zero value, before Sep 1 2026) — callers without a real
-	// session timestamp get introductory pricing for Sonnet 5, which is acceptable.
-	// The codex provider uses computeFromCodexRolloutAt to pass the actual session date.
-	computeCodexTokens(logger.Ctx(ctx), result, rollouts, time.Time{})
+	computeCodexTokens(logger.Ctx(ctx), result, rollouts)
 	computeCodexSession(result, rollouts)
 
 	// Conversation stays main-only: turn counts + timing reflect user-perceived
@@ -65,40 +68,6 @@ func ComputeFromCodexRollout(ctx context.Context, rollouts []*codex.ParsedRollou
 
 	// Remaining analyzers accumulate via += on result fields, so per-rollout
 	// dispatch produces the cross-rollout total.
-	for _, r := range rollouts {
-		if r == nil {
-			continue
-		}
-		computeCodexTools(result, r)
-		computeCodexCodeActivity(result, r)
-		computeCodexAgentsAndSkills(result, r)
-		computeCodexRedactions(result, r)
-		result.ValidationErrorCount += len(r.ValidationErrors)
-	}
-
-	return result
-}
-
-// computeFromCodexRolloutAt is the date-aware variant of ComputeFromCodexRollout.
-// It accepts a sessionAt timestamp for accurate Sonnet 5 introductory-rate routing.
-// Called by codexProvider.ComputeCards which has the actual session first_seen date.
-func computeFromCodexRolloutAt(ctx context.Context, rollouts []*codex.ParsedRollout, sessionAt time.Time) *ComputeResult {
-	if len(rollouts) == 0 || rollouts[0] == nil {
-		return &ComputeResult{}
-	}
-
-	result := &ComputeResult{
-		ToolStats:         make(map[string]*ToolStats),
-		LanguageBreakdown: make(map[string]int),
-		AgentStats:        make(map[string]*AgentStats),
-		SkillStats:        make(map[string]*SkillStats),
-		RedactionCounts:   make(map[string]int),
-	}
-
-	computeCodexTokens(logger.Ctx(ctx), result, rollouts, sessionAt)
-	computeCodexSession(result, rollouts)
-	computeCodexConversation(result, rollouts[0])
-
 	for _, r := range rollouts {
 		if r == nil {
 			continue

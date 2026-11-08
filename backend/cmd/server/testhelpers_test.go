@@ -57,13 +57,14 @@ var serverEnvKeys = []string{
 	"RESEND_API_KEY", "EMAIL_FROM_ADDRESS", "EMAIL_FROM_NAME",
 	"EMAIL_RATE_LIMIT_PER_HOUR",
 	"ENABLE_PPROF", "SHARE_ALL_SESSIONS_TO_AUTHENTICATED",
-	"ENABLE_SHARE_CREATION", "ENABLE_SAAS_FOOTER", "ENABLE_SAAS_TERMLY",
+	"ENABLE_SHARE_CREATION", "ENABLE_SAAS_FOOTER",
 	"WORKER_POLL_INTERVAL", "WORKER_MAX_SESSIONS",
 	"WORKER_MAX_SEARCH_INDEX_SESSIONS", "WORKER_DRY_RUN",
 	"WORKER_SHARE_RETENTION",
 	"S3_ENDPOINT", "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY",
 	"BUCKET_NAME", "S3_USE_SSL",
-	"SMART_RECAP_ENABLED", "ANTHROPIC_API_KEY", "SMART_RECAP_MODEL",
+	"SMART_RECAP_ENABLED", "SMART_RECAP_LLM_PROVIDER",
+	"ANTHROPIC_API_KEY", "OPENAI_API_KEY", "SMART_RECAP_MODEL",
 	"SMART_RECAP_QUOTA_LIMIT", "SMART_RECAP_MAX_OUTPUT_TOKENS",
 	"SMART_RECAP_MAX_TRANSCRIPT_TOKENS",
 	"WORKER_REGULAR_THRESHOLD_PCT", "WORKER_REGULAR_BASE_MIN_LINES",
@@ -110,14 +111,34 @@ type fakePrecomputer struct {
 	precomputeRegFn   func(context.Context, analytics.StaleSession) error
 	precomputeRecapFn func(context.Context, analytics.StaleSession) error
 	buildSearchIdxFn  func(context.Context, analytics.StaleSession) error
+	findTitleFn       func(context.Context, int) ([]analytics.StaleSession, error)
+	recomputeTitleFn  func(context.Context, analytics.StaleSession) error
 
 	findStaleCalls       int
 	findSmartRecapCalls  int
 	findSearchIndexCalls int
+	findTitleCalls       int
 
 	regularCalls   []analytics.StaleSession
 	recapCalls     []analytics.StaleSession
 	searchIdxCalls []analytics.StaleSession
+	titleCalls     []analytics.StaleSession
+}
+
+func (f *fakePrecomputer) FindTitleRecomputeSessions(ctx context.Context, limit int) ([]analytics.StaleSession, error) {
+	f.findTitleCalls++
+	if f.findTitleFn != nil {
+		return f.findTitleFn(ctx, limit)
+	}
+	return nil, nil
+}
+
+func (f *fakePrecomputer) RecomputeSessionTitle(ctx context.Context, session analytics.StaleSession) error {
+	f.titleCalls = append(f.titleCalls, session)
+	if f.recomputeTitleFn != nil {
+		return f.recomputeTitleFn(ctx, session)
+	}
+	return nil
 }
 
 func (f *fakePrecomputer) FindStaleSessions(ctx context.Context, limit int) ([]analytics.StaleSession, error) {
@@ -166,4 +187,70 @@ func (f *fakePrecomputer) BuildSearchIndexOnly(ctx context.Context, session anal
 		return f.buildSearchIdxFn(ctx, session)
 	}
 	return nil
+}
+
+// failureCall is one recorded call on fakeFailureTracker. ctxErr captures
+// ctx.Err() at call time so tests can assert bookkeeping survives cancellation.
+type failureCall struct {
+	op        string // claim | success | failure | release | sweep
+	sessionID string
+	bucket    string
+	errMsg    string
+	ctxErr    error
+}
+
+// fakeFailureTracker satisfies precomputeFailureTracker. Unset Fn fields
+// succeed; recordFailureFn defaults to (1, false, nil).
+type fakeFailureTracker struct {
+	claimErr        error
+	recordFailureFn func(sessionID, bucket, errMsg string) (int, bool, error)
+	sweepFn         func() (int, error)
+
+	calls []failureCall
+}
+
+func (f *fakeFailureTracker) record(ctx context.Context, op, sessionID, bucket, errMsg string) {
+	f.calls = append(f.calls, failureCall{op: op, sessionID: sessionID, bucket: bucket, errMsg: errMsg, ctxErr: ctx.Err()})
+}
+
+func (f *fakeFailureTracker) ClaimAttempt(ctx context.Context, sessionID, bucket string) error {
+	f.record(ctx, "claim", sessionID, bucket, "")
+	return f.claimErr
+}
+
+func (f *fakeFailureTracker) RecordSuccess(ctx context.Context, sessionID, bucket string) error {
+	f.record(ctx, "success", sessionID, bucket, "")
+	return nil
+}
+
+func (f *fakeFailureTracker) RecordFailure(ctx context.Context, sessionID, bucket, errMsg string) (int, bool, error) {
+	f.record(ctx, "failure", sessionID, bucket, errMsg)
+	if f.recordFailureFn != nil {
+		return f.recordFailureFn(sessionID, bucket, errMsg)
+	}
+	return 1, false, nil
+}
+
+func (f *fakeFailureTracker) ReleaseAttempt(ctx context.Context, sessionID, bucket string) error {
+	f.record(ctx, "release", sessionID, bucket, "")
+	return nil
+}
+
+func (f *fakeFailureTracker) SweepCrashedAttempts(ctx context.Context) (int, error) {
+	f.record(ctx, "sweep", "", "", "")
+	if f.sweepFn != nil {
+		return f.sweepFn()
+	}
+	return 0, nil
+}
+
+// ops returns the recorded op names in order, optionally for one session.
+func (f *fakeFailureTracker) ops(sessionID string) []string {
+	var out []string
+	for _, c := range f.calls {
+		if sessionID == "" || c.sessionID == sessionID {
+			out = append(out, c.op)
+		}
+	}
+	return out
 }

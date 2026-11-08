@@ -3,22 +3,19 @@ package analytics
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strconv"
 	"strings"
 	"time"
-
-	"github.com/ConfabulousDev/confab-web/internal/anthropic"
-	"go.opentelemetry.io/otel/attribute"
-	"go.opentelemetry.io/otel/codes"
-	"go.opentelemetry.io/otel/trace"
 )
 
 const (
 	// DefaultMaxOutputTokens is the default maximum number of output tokens for the recap.
-	// Recaps for long sessions routinely exceed 1000 tokens; a tight cap silently
-	// truncates the JSON mid-generation and the parse fails on every retry.
+	// Fork: raised from upstream's 1000. Recaps for long sessions routinely exceed
+	// 1000 tokens; a tight cap truncates the JSON mid-generation (stop_reason
+	// max_tokens) and the parse fails on every retry.
 	DefaultMaxOutputTokens = 4000
 
 	// DefaultMaxTranscriptTokens is the default approximate maximum input size (characters / 4 as rough estimate).
@@ -45,8 +42,8 @@ func (a *AnnotatedItem) UnmarshalJSON(data []byte) error {
 
 	// Try object format
 	type annotatedItemRaw struct {
-		Text      string      `json:"text"`
-		MessageID interface{} `json:"message_id,omitempty"`
+		Text      string `json:"text"`
+		MessageID any    `json:"message_id,omitempty"`
 	}
 	var raw annotatedItemRaw
 	if err := json.Unmarshal(data, &raw); err != nil {
@@ -82,43 +79,10 @@ type SmartRecapResult struct {
 	GenerationTimeMs int
 }
 
-// smartRecapSchema is the JSON schema enforced via structured outputs
-// (output_config.format). It guarantees the response is a single valid JSON
-// object matching SmartRecapResult — no preamble, no trailing commentary, no
-// malformed JSON. Must stay in sync with SmartRecapResult and the FIXED
-// output-format section of the system prompt.
-const smartRecapSchema = `{
-	"type": "object",
-	"properties": {
-		"suggested_session_title": {"type": "string"},
-		"recap": {"type": "string"},
-		"went_well": {"$ref": "#/$defs/items"},
-		"went_bad": {"$ref": "#/$defs/items"},
-		"human_suggestions": {"$ref": "#/$defs/items"},
-		"environment_suggestions": {"$ref": "#/$defs/items"},
-		"default_context_suggestions": {"$ref": "#/$defs/items"}
-	},
-	"required": ["suggested_session_title", "recap", "went_well", "went_bad", "human_suggestions", "environment_suggestions", "default_context_suggestions"],
-	"additionalProperties": false,
-	"$defs": {
-		"items": {
-			"type": "array",
-			"items": {
-				"type": "object",
-				"properties": {
-					"text": {"type": "string"},
-					"message_id": {"type": "integer"}
-				},
-				"required": ["text", "message_id"],
-				"additionalProperties": false
-			}
-		}
-	}
-}`
-
-// SmartRecapAnalyzer generates AI-powered session recaps using Claude Haiku.
+// SmartRecapAnalyzer generates AI-powered session recaps using the configured
+// LLM vendor (see recapLLM). Parsing and message-id resolution are vendor-agnostic.
 type SmartRecapAnalyzer struct {
-	client             *anthropic.Client
+	llm                recapLLM
 	model              string
 	maxOutputTokens    int
 	maxTranscriptChars int
@@ -132,8 +96,8 @@ type SmartRecapAnalyzerConfig struct {
 	SystemPrompt        string // Fully assembled system prompt. If empty, uses the default.
 }
 
-// NewSmartRecapAnalyzer creates a new analyzer with the given Anthropic client.
-func NewSmartRecapAnalyzer(client *anthropic.Client, model string, cfg SmartRecapAnalyzerConfig) *SmartRecapAnalyzer {
+// NewSmartRecapAnalyzer creates a new analyzer that generates through llm.
+func NewSmartRecapAnalyzer(llm recapLLM, model string, cfg SmartRecapAnalyzerConfig) *SmartRecapAnalyzer {
 	maxOutput := cfg.MaxOutputTokens
 	if maxOutput <= 0 {
 		maxOutput = DefaultMaxOutputTokens
@@ -147,7 +111,7 @@ func NewSmartRecapAnalyzer(client *anthropic.Client, model string, cfg SmartReca
 		systemPrompt = BuildSmartRecapSystemPrompt(nil)
 	}
 	return &SmartRecapAnalyzer{
-		client:             client,
+		llm:                llm,
 		model:              model,
 		maxOutputTokens:    maxOutput,
 		maxTranscriptChars: maxTranscriptTokens * 4,
@@ -158,11 +122,7 @@ func NewSmartRecapAnalyzer(client *anthropic.Client, model string, cfg SmartReca
 // Analyze generates a smart recap for the given transcript and analytics stats.
 // cardStats contains the computed analytics cards (tokens, session, conversation, etc.)
 // which are included in the prompt for additional context.
-func (a *SmartRecapAnalyzer) Analyze(ctx context.Context, input GenerateInput, cardStats map[string]interface{}) (*SmartRecapResult, error) {
-	ctx, span := tracer.Start(ctx, "analytics.smart_recap.analyze",
-		trace.WithAttributes(attribute.String("llm.model", a.model)))
-	defer span.End()
-
+func (a *SmartRecapAnalyzer) Analyze(ctx context.Context, input GenerateInput, cardStats map[string]any) (*SmartRecapResult, error) {
 	// Use pre-built transcript if provided (streaming path), otherwise build from FileCollection
 	transcript := input.Transcript
 	idMap := input.IDMap
@@ -170,10 +130,7 @@ func (a *SmartRecapAnalyzer) Analyze(ctx context.Context, input GenerateInput, c
 		transcript, idMap = PrepareTranscript(input.FileCollection)
 	}
 	if transcript == "" {
-		err := fmt.Errorf("no content to analyze")
-		span.RecordError(err)
-		span.SetStatus(codes.Error, err.Error())
-		return nil, err
+		return nil, errors.New("no content to analyze")
 	}
 
 	// Prepare the stats section
@@ -185,79 +142,48 @@ func (a *SmartRecapAnalyzer) Analyze(ctx context.Context, input GenerateInput, c
 		userContent = transcript + "\n\n" + statsSection
 	}
 
-	// Track content size
-	contentLen := len(userContent)
-	truncated := false
-
 	// Truncate if too long (prioritize transcript, stats are at the end)
-	if contentLen > a.maxTranscriptChars {
+	if len(userContent) > a.maxTranscriptChars {
 		// Truncate transcript portion, keep stats
 		maxTranscript := a.maxTranscriptChars - len(statsSection) - 100 // leave room for truncation message
 		if maxTranscript > 0 && len(transcript) > maxTranscript {
 			transcript = transcript[:maxTranscript] + "\n\n[Transcript truncated due to length]"
 			userContent = transcript + "\n\n" + statsSection
 		}
-		truncated = true
 	}
-
-	span.SetAttributes(
-		attribute.Int("content.chars", contentLen),
-		attribute.Bool("content.truncated", truncated),
-		attribute.Bool("stats.included", statsSection != ""),
-	)
 
 	start := time.Now()
 
-	resp, err := a.client.CreateMessage(ctx, &anthropic.MessagesRequest{
-		Model:     a.model,
-		MaxTokens: a.maxOutputTokens,
-		System:    a.systemPrompt,
-		OutputConfig: &anthropic.OutputConfig{
-			Format: &anthropic.OutputFormat{
-				Type:   "json_schema",
-				Schema: []byte(smartRecapSchema),
-			},
-		},
-		Messages: []anthropic.Message{
-			{Role: "user", Content: userContent},
-		},
+	resp, err := a.llm.Generate(ctx, recapLLMRequest{
+		Model:           a.model,
+		System:          a.systemPrompt,
+		User:            userContent,
+		MaxOutputTokens: a.maxOutputTokens,
 	})
 	if err != nil {
-		span.RecordError(err)
-		span.SetStatus(codes.Error, err.Error())
 		return nil, fmt.Errorf("LLM request failed: %w", err)
 	}
 
 	generationTimeMs := int(time.Since(start).Milliseconds())
 
-	llmContent := resp.GetTextContent()
-	result, err := parseSmartRecapResponse(llmContent)
+	result, err := parseSmartRecapResponse(resp.Text)
 	if err != nil {
 		// Log the raw LLM response for debugging parse failures
 		slog.Error("smart recap parse failed",
 			"error", err,
 			"model", a.model,
-			"response_length", len(llmContent),
-			"raw_response", llmContent,
+			"response_length", len(resp.Text),
+			"raw_response", resp.Text,
 		)
-		span.RecordError(err)
-		span.SetStatus(codes.Error, err.Error())
 		return nil, fmt.Errorf("failed to parse LLM response: %w", err)
 	}
 
 	// Translate integer message_ids from LLM response to real UUIDs
 	resolveMessageIDs(result, idMap)
 
-	result.InputTokens = resp.Usage.InputTokens
-	result.OutputTokens = resp.Usage.OutputTokens
+	result.InputTokens = resp.InputTokens
+	result.OutputTokens = resp.OutputTokens
 	result.GenerationTimeMs = generationTimeMs
-
-	// Record final metrics
-	span.SetAttributes(
-		attribute.Int("llm.tokens.input", result.InputTokens),
-		attribute.Int("llm.tokens.output", result.OutputTokens),
-		attribute.Int("generation.time_ms", generationTimeMs),
-	)
 
 	return result, nil
 }
@@ -300,7 +226,7 @@ func (c FormatConfig) truncate(s string, limit int) string {
 // This provides additional context about session metrics for pattern detection.
 // Provider-agnostic: works on the canonical *CardData types produced by both
 // Claude and Codex compute paths.
-func PrepareStats(cardStats map[string]interface{}) string {
+func PrepareStats(cardStats map[string]any) string {
 	if len(cardStats) == 0 {
 		return ""
 	}

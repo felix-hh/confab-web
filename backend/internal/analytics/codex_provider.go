@@ -1,11 +1,10 @@
 package analytics
 
 import (
-	"bytes"
 	"context"
+	"database/sql"
 	"fmt"
 	"log/slog"
-	"time"
 
 	"github.com/ConfabulousDev/confab-web/internal/codex"
 	"github.com/ConfabulousDev/confab-web/internal/models"
@@ -23,9 +22,6 @@ type codexRollout struct {
 	agentFileInfo []codexAgentFileInfo
 	downloader    codexAgentDownloader
 	cachedAgents  []*codex.ParsedRollout
-	// createdAt is the session's first_seen timestamp, forwarded to
-	// computeFromCodexRolloutAt for date-aware pricing (e.g. Sonnet 5 intro rates).
-	createdAt     time.Time
 }
 
 type codexAgentFileInfo struct {
@@ -53,13 +49,12 @@ func (p *codexProvider) Parse(ctx context.Context, input ParseInput) (Rollout, e
 		main:          main,
 		agentFileInfo: agentFileInfo,
 		downloader:    downloader,
-		createdAt:     input.CreatedAt,
 	}, nil
 }
 
 func (p *codexProvider) ComputeCards(ctx context.Context, rollout Rollout) *ComputeResult {
 	r := rollout.(*codexRollout)
-	return computeFromCodexRolloutAt(ctx, r.materialize(ctx), r.createdAt)
+	return ComputeFromCodexRollout(ctx, r.materialize(ctx))
 }
 
 func (p *codexProvider) SearchText(ctx context.Context, rollout Rollout) string {
@@ -115,7 +110,7 @@ func (r *codexRollout) loadSubagent(ctx context.Context, fileName string) (*code
 		slog.WarnContext(ctx, "codex subagent download failed", "file", fileName, "error", err)
 		return nil, fmt.Errorf("download failed: %w", err)
 	}
-	parsed, err := codex.ParseRollout(bytes.NewReader(raw))
+	parsed, err := codex.ParseRollout(raw)
 	if err != nil {
 		slog.WarnContext(ctx, "codex subagent parse failed", "file", fileName, "error", err)
 		return nil, fmt.Errorf("parse failed: %w", err)
@@ -126,27 +121,26 @@ func (r *codexRollout) loadSubagent(ctx context.Context, fileName string) (*code
 	return parsed, nil
 }
 
-// loadCodexMainAndListAgents downloads + parses the main transcript and
-// lists subagent rollout file names. Returns (nil, nil, nil) when the session
-// has no transcript row yet.
-func loadCodexMainAndListAgents(ctx context.Context, input ParseInput) (*codex.ParsedRollout, []codexAgentFileInfo, error) {
-	rows, err := input.DB.QueryContext(ctx, `
+// listCodexSyncFiles resolves a Codex session's main transcript file name (the
+// first 'transcript' sync_files row) and its subagent rollout files. mainFileName
+// is "" when the session has no transcript row yet. Shared by the card parse path
+// and the session title recompute.
+func listCodexSyncFiles(ctx context.Context, conn *sql.DB, sessionID string) (mainFileName string, agents []codexAgentFileInfo, err error) {
+	rows, err := conn.QueryContext(ctx, `
 		SELECT file_name, file_type
 		FROM sync_files
 		WHERE session_id = $1 AND file_type IN ('transcript', 'agent')
 		ORDER BY id ASC
-	`, input.SessionID)
+	`, sessionID)
 	if err != nil {
-		return nil, nil, err
+		return "", nil, err
 	}
 	defer rows.Close()
 
-	var mainFileName string
-	var agentFileInfo []codexAgentFileInfo
 	for rows.Next() {
 		var fileName, fileType string
 		if err := rows.Scan(&fileName, &fileType); err != nil {
-			return nil, nil, err
+			return "", nil, err
 		}
 		switch fileType {
 		case "transcript":
@@ -154,10 +148,18 @@ func loadCodexMainAndListAgents(ctx context.Context, input ParseInput) (*codex.P
 				mainFileName = fileName
 			}
 		case "agent":
-			agentFileInfo = append(agentFileInfo, codexAgentFileInfo{FileName: fileName})
+			agents = append(agents, codexAgentFileInfo{FileName: fileName})
 		}
 	}
-	if err := rows.Err(); err != nil {
+	return mainFileName, agents, rows.Err()
+}
+
+// loadCodexMainAndListAgents downloads + parses the main transcript and
+// lists subagent rollout file names. Returns (nil, nil, nil) when the session
+// has no transcript row yet.
+func loadCodexMainAndListAgents(ctx context.Context, input ParseInput) (*codex.ParsedRollout, []codexAgentFileInfo, error) {
+	mainFileName, agentFileInfo, err := listCodexSyncFiles(ctx, input.DB, input.SessionID)
+	if err != nil {
 		return nil, nil, err
 	}
 	if mainFileName == "" {
@@ -168,7 +170,7 @@ func loadCodexMainAndListAgents(ctx context.Context, input ParseInput) (*codex.P
 	if err != nil || raw == nil {
 		return nil, nil, err
 	}
-	main, err := codex.ParseRollout(bytes.NewReader(raw))
+	main, err := codex.ParseRollout(raw)
 	if err != nil {
 		return nil, nil, fmt.Errorf("parse codex rollout: %w", err)
 	}

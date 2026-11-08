@@ -4,7 +4,6 @@ import (
 	"context"
 	"log/slog"
 	"sort"
-	"time"
 
 	"github.com/ConfabulousDev/confab-web/internal/logger"
 	"github.com/shopspring/decimal"
@@ -40,10 +39,7 @@ func ComputeFromOpenCodeRollout(ctx context.Context, rollouts [][]*OpenCodeMessa
 	}
 
 	// Tokens and Session aggregate across all rollouts internally.
-	// Pass time.Time{} (zero value, before Sep 1 2026) — callers without a real
-	// session timestamp get introductory pricing for Sonnet 5, which is acceptable.
-	// The opencode provider uses computeFromOpenCodeRolloutAt to pass the actual session date.
-	computeOpenCodeTokens(logger.Ctx(ctx), result, rollouts, time.Time{})
+	computeOpenCodeTokens(logger.Ctx(ctx), result, rollouts)
 	computeOpenCodeSession(result, rollouts)
 
 	// Conversation stays main-only: turn counts + timing reflect user-perceived
@@ -52,39 +48,6 @@ func ComputeFromOpenCodeRollout(ctx context.Context, rollouts [][]*OpenCodeMessa
 
 	// Remaining analyzers accumulate via += on result fields, so per-rollout
 	// dispatch produces the cross-rollout total.
-	for _, messages := range rollouts {
-		if len(messages) == 0 {
-			continue
-		}
-		computeOpenCodeTools(result, messages)
-		computeOpenCodeCodeActivity(result, messages)
-		computeOpenCodeAgentsAndSkills(result, messages)
-		computeOpenCodeRedactions(result, messages)
-	}
-
-	return result
-}
-
-// computeFromOpenCodeRolloutAt is the date-aware variant of ComputeFromOpenCodeRollout.
-// It accepts a sessionAt timestamp for accurate Sonnet 5 introductory-rate routing.
-// Called by opencodeProvider.ComputeCards which has the actual session first_seen date.
-func computeFromOpenCodeRolloutAt(ctx context.Context, rollouts [][]*OpenCodeMessage, sessionAt time.Time) *ComputeResult {
-	if len(rollouts) == 0 || len(rollouts[0]) == 0 {
-		return &ComputeResult{}
-	}
-
-	result := &ComputeResult{
-		ToolStats:         make(map[string]*ToolStats),
-		LanguageBreakdown: make(map[string]int),
-		AgentStats:        make(map[string]*AgentStats),
-		SkillStats:        make(map[string]*SkillStats),
-		RedactionCounts:   make(map[string]int),
-	}
-
-	computeOpenCodeTokens(logger.Ctx(ctx), result, rollouts, sessionAt)
-	computeOpenCodeSession(result, rollouts)
-	computeOpenCodeConversation(result, rollouts[0])
-
 	for _, messages := range rollouts {
 		if len(messages) == 0 {
 			continue
@@ -108,7 +71,7 @@ func getStringInput(state *OpenCodeToolState, key string) string {
 	return ""
 }
 
-func computeOpenCodeTokens(log *slog.Logger, out *ComputeResult, rollouts [][]*OpenCodeMessage, sessionAt time.Time) {
+func computeOpenCodeTokens(log *slog.Logger, out *ComputeResult, rollouts [][]*OpenCodeMessage) {
 	type modelKey struct {
 		providerID string
 		modelID    string
@@ -130,9 +93,12 @@ func computeOpenCodeTokens(log *slog.Logger, out *ComputeResult, rollouts [][]*O
 			}
 
 			// Normalize tokens to the provider's billing convention, per message.
-			// OpenAI bills cached input as a subset of `input` and never charges
-			// cache writes; everyone else (Anthropic-style) bills writes and treats
-			// reads as independent of input.
+			// OpenAI bills cached input as a subset of `input`; everyone else
+			// (Anthropic-style) bills writes and treats reads as independent of
+			// input. OpenCode does report a cache-write count for OpenAI, but it is
+			// zeroed rather than billed (md0z) — the 5.6 and 6 families do carry a
+			// real cache-write rate in pricing.json, so this is an open question,
+			// not a $0 rate.
 			input := msg.Info.Tokens.Input
 			cacheWrite := msg.Info.Tokens.Cache.Write
 			if msg.Info.ProviderID == "openai" {
@@ -154,7 +120,7 @@ func computeOpenCodeTokens(log *slog.Logger, out *ComputeResult, rollouts [][]*O
 			if msg.Info.Cost > 0 {
 				cost = decimal.NewFromFloat(msg.Info.Cost)
 			} else {
-				cost = CalculateCost(pricingForModel(log, msg.Info.ModelID, sessionAt), input, msg.Info.Tokens.Output, cacheWrite, msg.Info.Tokens.Cache.Read)
+				cost = CalculateCost(pricingForModel(log, msg.Info.ModelID), input, msg.Info.Tokens.Output, cacheWrite, msg.Info.Tokens.Cache.Read)
 			}
 
 			key := modelKey{msg.Info.ProviderID, msg.Info.ModelID}

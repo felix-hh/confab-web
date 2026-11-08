@@ -128,6 +128,192 @@ ${createSystemMessage(2)}`;
       typeName: 'custom-title',
       payload: { type: 'custom-title', customTitle: 'My session', sessionId: 'abc-123' },
     },
+    // Bookkeeping rows Claude Code 2.1.228+ emits (k6c3). Shapes taken from real
+    // session JSONL; values here are fake.
+    {
+      typeName: 'atis-latch',
+      payload: { type: 'atis-latch', atis: 'v1.fake-atis-token', sessionId: 'abc-123' },
+    },
+    {
+      typeName: 'file-history-delta',
+      payload: {
+        type: 'file-history-delta',
+        messageId: 'msg-uuid-1',
+        snapshotMessageId: 'snapshot-uuid-1',
+        trackingPath: 'src/example.ts',
+        backup: {
+          backupFileName: '0123456789abcdef@v1',
+          version: 1,
+          backupTime: '2026-01-01T00:00:00.000Z',
+          realParentDir: '/tmp/project/src',
+        },
+        timestamp: '2026-01-01T00:00:00.000Z',
+      },
+    },
+    {
+      typeName: 'cost-state',
+      payload: {
+        type: 'cost-state',
+        sessionId: 'abc-123',
+        totalCostUSD: 1.25,
+        totalAPIDuration: 1000,
+        totalAPIDurationWithoutRetries: 900,
+        totalToolDuration: 500,
+        totalLinesAdded: 2,
+        totalLinesRemoved: 3,
+        totalDuration: 5000,
+        startTime: 1767225600000,
+        modelUsage: {
+          'claude-opus-5': {
+            inputTokens: 10,
+            outputTokens: 20,
+            thinkingTokens: 5,
+            cacheReadInputTokens: 100,
+            cacheCreationInputTokens: 50,
+            webSearchRequests: 0,
+            costUSD: 1.25,
+          },
+        },
+        hasUnknownModelCost: false,
+      },
+    },
+    {
+      typeName: 'bridge-session',
+      payload: {
+        type: 'bridge-session',
+        sessionId: 'abc-123',
+        bridgeSessionId: 'cse_fake',
+        lastSequenceNum: 0,
+        ownerAccountUuid: 'account-uuid-1',
+        ownerOrganizationUuid: 'org-uuid-1',
+      },
+    },
+    // API-request ledger and other bookkeeping rows Claude Code 2.1.300+ emits
+    // (q8ah). Shapes taken from real session JSONL; values here are fake.
+    {
+      typeName: 'api-request',
+      payload: {
+        type: 'api-request',
+        sessionId: 'abc-123',
+        id: 'req-2',
+        timestamp: '2026-01-01T00:00:00.000Z',
+        version: '2.1.300',
+        querySource: 'repl_main_thread',
+        shapeHash: 'shape-hash-1',
+        params: {
+          model: 'claude-opus-5',
+          betas: ['fake-beta'],
+          max_tokens: 1024,
+          thinking: { type: 'adaptive' },
+          context_management: { edits: [] },
+          safeguards: [],
+          output_config: {},
+        },
+        base: 'req-1',
+        keep: 3,
+        tail: ['blob-hash-1'],
+        cacheControl: [],
+        requestDigest: 'digest-1',
+      },
+    },
+    {
+      typeName: 'api-request-blob',
+      payload: {
+        type: 'api-request-blob',
+        sessionId: 'abc-123',
+        hash: 'blob-hash-1',
+        message: { role: 'user', content: [{ type: 'text', text: 'hello' }] },
+      },
+    },
+    {
+      typeName: 'api-request-shape',
+      payload: {
+        type: 'api-request-shape',
+        sessionId: 'abc-123',
+        shapeHash: 'shape-hash-1',
+        timestamp: '2026-01-01T00:00:00.000Z',
+        version: '2.1.300',
+        shape: { system: [{ type: 'text', text: 'fake system prompt' }], tools: [] },
+      },
+    },
+    {
+      typeName: 'artifact-autoreact-ledger',
+      payload: {
+        type: 'artifact-autoreact-ledger',
+        v: 1,
+        sessionId: 'abc-123',
+        accountUuid: 'account-uuid-1',
+        artifacts: {
+          'artifact-1': {
+            savedAt: 1767225600000,
+            stampHighWater: 0,
+            everBaselined: true,
+            everHadThreads: false,
+            turnTimestamps: [],
+            threads: [],
+          },
+        },
+      },
+    },
+    {
+      typeName: 'artifact-comment-monitor',
+      payload: {
+        type: 'artifact-comment-monitor',
+        v: 1,
+        sessionId: 'abc-123',
+        artifacts: { 'artifact-1': { state: 'watching', writtenAtMs: 1767225600000, title: 'Fake page' } },
+      },
+    },
+    {
+      typeName: 'agent-setting',
+      payload: { type: 'agent-setting', agentSetting: 'general-purpose', sessionId: 'abc-123' },
+    },
+    {
+      typeName: 'frame-link',
+      payload: {
+        type: 'frame-link',
+        sessionId: 'abc-123',
+        path: '/tmp/fake/page.html',
+        frameUrl: 'https://example.com/frame/fake',
+        title: 'Fake page',
+        artifactCount: 1,
+        timestamp: '2026-01-01T00:00:00.000Z',
+      },
+    },
+    {
+      typeName: 'continued-in',
+      payload: {
+        type: 'continued-in',
+        sessionId: 'abc-123',
+        continuedInSessionId: 'def-456',
+        timestamp: '2026-01-01T00:00:00.000Z',
+      },
+    },
+    // Bookkeeping rows Claude Code 2.1.317 emits (7ybs). Shapes taken from real
+    // session JSONL; values here are fake.
+    {
+      typeName: 'session-owner',
+      payload: {
+        type: 'session-owner',
+        accountUuid: '00000000-0000-0000-0000-000000000001',
+        organizationUuid: '00000000-0000-0000-0000-000000000002',
+        sessionId: 'abc-123',
+      },
+    },
+    {
+      typeName: 'tools-used',
+      payload: { type: 'tools-used', tools: ['Bash', 'Agent'], sessionId: 'abc-123' },
+    },
+    {
+      typeName: 'fork-context-ref',
+      payload: {
+        type: 'fork-context-ref',
+        agentId: 'a0000000000000000',
+        parentSessionId: 'abc-123',
+        parentLastUuid: '00000000-0000-0000-0000-000000000003',
+        contextLength: 3,
+      },
+    },
   ])('skips $typeName messages silently', ({ payload }) => {
     const skippedLine = JSON.stringify(payload);
 

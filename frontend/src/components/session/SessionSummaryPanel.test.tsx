@@ -5,6 +5,7 @@ import type { SessionAnalytics } from '@/schemas/api';
 import { SessionAnalyticsSchema } from '@/schemas/api';
 import { analyticsAPI, APIError, APIValidationError } from '@/services/api';
 import { buildCursorAnalyticsFixture } from './cursorAnalyticsFixture';
+import { PROVIDER_METADATA } from '@/utils/providers';
 
 // Mock useAnalyticsPolling
 const mockForceRefetch = vi.fn();
@@ -157,6 +158,43 @@ describe('SessionSummaryPanel', () => {
     it('surfaces a plain Error message when neither HTTP nor validation', () => {
       renderWithError(new Error('NetworkError: failed to fetch'));
       expect(screen.getByText(/failed to fetch/)).toBeInTheDocument();
+    });
+  });
+
+  describe('smart_recap llm_provider schema (pedp)', () => {
+    const smartRecap = {
+      recap: 'Recap.',
+      went_well: [],
+      went_bad: [],
+      human_suggestions: [],
+      environment_suggestions: [],
+      default_context_suggestions: [],
+      computed_at: '2024-01-15T10:30:00Z',
+      model_used: 'gpt-6-luna',
+    };
+    const withVendor = (vendor?: string): unknown => {
+      const fixture = buildCursorAnalyticsFixture();
+      return {
+        ...fixture,
+        cards: {
+          ...fixture.cards,
+          smart_recap: vendor === undefined ? smartRecap : { ...smartRecap, llm_provider: vendor },
+        },
+      };
+    };
+
+    it('accepts the anthropic and openai LLM vendors', () => {
+      expect(SessionAnalyticsSchema.safeParse(withVendor('anthropic')).success).toBe(true);
+      expect(SessionAnalyticsSchema.safeParse(withVendor('openai')).success).toBe(true);
+    });
+
+    it('rejects a smart recap missing llm_provider or with an unknown vendor', () => {
+      const missing = SessionAnalyticsSchema.safeParse(withVendor());
+      expect(missing.success).toBe(false);
+      if (!missing.success) {
+        expect(JSON.stringify(missing.error.issues)).toContain('llm_provider');
+      }
+      expect(SessionAnalyticsSchema.safeParse(withVendor('gemini')).success).toBe(false);
     });
   });
 
@@ -314,6 +352,7 @@ describe('SessionSummaryPanel', () => {
             default_context_suggestions: [],
             computed_at: '2024-01-15T10:30:00Z',
             model_used: 'claude-sonnet-4-20250514',
+            llm_provider: 'anthropic',
           },
         },
       };
@@ -347,6 +386,7 @@ describe('SessionSummaryPanel', () => {
             default_context_suggestions: [],
             computed_at: '2024-01-15T10:30:00Z',
             model_used: 'claude-sonnet-4-20250514',
+            llm_provider: 'anthropic',
           },
         },
       };
@@ -368,7 +408,7 @@ describe('SessionSummaryPanel', () => {
   });
 
   describe('provider wiring for cards (CF-439)', () => {
-    it('passes provider through to CodeActivityCard (codex hides Files read + sets Searches tooltip)', () => {
+    it('passes provider through to CodeActivityCard (codex gets the era tooltips)', () => {
       const codexAnalytics: SessionAnalytics = {
         ...baseAnalytics,
         cards: {
@@ -393,15 +433,17 @@ describe('SessionSummaryPanel', () => {
         />
       );
 
-      // Files read row is hidden for Codex.
-      expect(screen.queryByText('Files read')).toBeNull();
+      // m2ky: the row is shown for Codex too, carrying the era tooltip.
+      const codexTooltips = PROVIDER_METADATA.codex.cardTooltips?.codeActivity;
+      expect(screen.getByText('Files read')).toBeInTheDocument();
+      expect(screen.getByText('Files read').closest('[title]')).toHaveAttribute(
+        'title',
+        codexTooltips?.filesRead
+      );
 
       // Searches row carries the Codex tooltip.
       const row = screen.getByText('Searches').closest('[title]');
-      expect(row).toHaveAttribute(
-        'title',
-        "Codex's web_search_call is not counted as file search"
-      );
+      expect(row).toHaveAttribute('title', codexTooltips?.searches);
     });
 
     it('claude-code provider keeps Files read row and omits Codex tooltip', () => {
@@ -455,6 +497,7 @@ describe('SessionSummaryPanel', () => {
               default_context_suggestions: [],
               computed_at: '2024-01-15T10:30:00Z',
               model_used: 'claude-sonnet-4-20250514',
+              llm_provider: 'anthropic',
             },
           },
         },
@@ -499,6 +542,7 @@ describe('SessionSummaryPanel', () => {
               default_context_suggestions: [],
               computed_at: '2024-01-15T10:30:00Z',
               model_used: 'claude-sonnet-4-20250514',
+              llm_provider: 'anthropic',
             },
           },
         },
@@ -542,6 +586,7 @@ describe('SessionSummaryPanel', () => {
               default_context_suggestions: [],
               computed_at: '2024-01-15T10:30:00Z',
               model_used: 'claude-sonnet-4-20250514',
+              llm_provider: 'anthropic',
             },
           },
         },
@@ -583,6 +628,7 @@ describe('SessionSummaryPanel', () => {
               default_context_suggestions: [],
               computed_at: '2024-01-15T10:30:00Z',
               model_used: 'claude-sonnet-4-20250514',
+              llm_provider: 'anthropic',
             },
           },
         },

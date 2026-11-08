@@ -1,6 +1,7 @@
 package analytics
 
 import (
+	"slices"
 	"time"
 )
 
@@ -20,14 +21,27 @@ var AllCardTableNames = []string{
 	"session_card_smart_recap",
 }
 
-// IsKnownCardTableName reports whether name is one of AllCardTableNames.
+// IsKnownCardTableName reports whether name is one of AllCardTableNames. It is the
+// gate for every path that interpolates a card table name into SQL; non-table
+// invalidation targets (SessionTitleInvalidationTarget) must never pass it.
 func IsKnownCardTableName(name string) bool {
-	for _, n := range AllCardTableNames {
-		if n == name {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(AllCardTableNames, name)
+}
+
+// SessionTitleInvalidationTarget is the non-card invalidation target (nbrd): it
+// marks title candidates (sessions.title_recompute_requested_at) so the
+// precompute worker re-derives first_user_message from stored data. See
+// session_title_recompute.go.
+const SessionTitleInvalidationTarget = "session_title"
+
+// AllInvalidationTargets is every value accepted in an admin invalidation
+// request's card_types: all card tables plus SessionTitleInvalidationTarget.
+// Served by GET /admin/cards/types.
+var AllInvalidationTargets = append(slices.Clone(AllCardTableNames), SessionTitleInvalidationTarget)
+
+// IsKnownInvalidationTarget reports whether name is one of AllInvalidationTargets.
+func IsKnownInvalidationTarget(name string) bool {
+	return slices.Contains(AllInvalidationTargets, name)
 }
 
 // Card version constants - increment when compute logic changes
@@ -165,10 +179,10 @@ type ConversationCardRecord struct {
 	Version                  int       `json:"version"`
 	ComputedAt               time.Time `json:"computed_at"`
 	UpToLine                 int64     `json:"up_to_line"`
-	UserTurns                int       `json:"user_turns"`                           // Count of human prompts
-	AssistantTurns           int       `json:"assistant_turns"`                      // Count of text responses
-	AvgAssistantTurnMs       *int64    `json:"avg_assistant_turn_ms,omitempty"`      // Average assistant turn duration
-	AvgUserThinkingMs        *int64    `json:"avg_user_thinking_ms,omitempty"`       // Average user thinking time
+	UserTurns                int       `json:"user_turns"`                            // Count of human prompts
+	AssistantTurns           int       `json:"assistant_turns"`                       // Count of text responses
+	AvgAssistantTurnMs       *int64    `json:"avg_assistant_turn_ms,omitempty"`       // Average assistant turn duration
+	AvgUserThinkingMs        *int64    `json:"avg_user_thinking_ms,omitempty"`        // Average user thinking time
 	TotalAssistantDurationMs *int64    `json:"total_assistant_duration_ms,omitempty"` // Total assistant turn duration
 	TotalUserDurationMs      *int64    `json:"total_user_duration_ms,omitempty"`      // Total user thinking time
 	AssistantUtilizationPct  *float64  `json:"assistant_utilization_pct,omitempty"`   // % of time Claude was working (0-100)
@@ -200,12 +214,12 @@ type AgentsAndSkillsCardRecord struct {
 
 // RedactionsCardRecord is the DB record for the redactions card.
 type RedactionsCardRecord struct {
-	SessionID        string         `json:"session_id"`
-	Version          int            `json:"version"`
-	ComputedAt       time.Time      `json:"computed_at"`
-	UpToLine         int64          `json:"up_to_line"`
-	TotalRedactions  int            `json:"total_redactions"`
-	RedactionCounts  map[string]int `json:"redaction_counts"` // Type -> count (e.g., "GITHUB_TOKEN" -> 5)
+	SessionID       string         `json:"session_id"`
+	Version         int            `json:"version"`
+	ComputedAt      time.Time      `json:"computed_at"`
+	UpToLine        int64          `json:"up_to_line"`
+	TotalRedactions int            `json:"total_redactions"`
+	RedactionCounts map[string]int `json:"redaction_counts"` // Type -> count (e.g., "GITHUB_TOKEN" -> 5)
 }
 
 // WorkflowRun is a single workflow run's aggregate. It is both the JSONB
@@ -254,6 +268,7 @@ type SmartRecapCardRecord struct {
 
 	// LLM metadata
 	ModelUsed        string `json:"model_used"`
+	LLMProvider      string `json:"llm_provider"` // LLMProviderAnthropic | LLMProviderOpenAI; legacy NULL rows read as anthropic
 	InputTokens      int    `json:"input_tokens"`
 	OutputTokens     int    `json:"output_tokens"`
 	GenerationTimeMs *int   `json:"generation_time_ms,omitempty"`
@@ -388,6 +403,7 @@ type SmartRecapCardData struct {
 	DefaultContextSuggestions []AnnotatedItem `json:"default_context_suggestions"`
 	ComputedAt                string          `json:"computed_at"`
 	ModelUsed                 string          `json:"model_used"`
+	LLMProvider               string          `json:"llm_provider"` // "anthropic" | "openai"
 }
 
 // SmartRecapQuotaInfo contains quota information for smart recap generation.
@@ -493,4 +509,41 @@ func (c *Cards) AllValid(currentLineCount int64) bool {
 		c.AgentsAndSkills.IsValid(currentLineCount) &&
 		c.Redactions.IsValid(currentLineCount) &&
 		c.Workflows.IsValid(currentLineCount)
+}
+
+// ServableStale reports whether the cards may be served while a newer
+// compute is pending: every card exists at its current schema version, and
+// only UpToLine may lag the session's line count. A missing card or a version
+// bump is never servable. When servable, it also returns the oldest card's
+// ComputedAt (the age that gates a background refresh).
+func (c *Cards) ServableStale() (oldestComputedAt time.Time, ok bool) {
+	if c == nil || c.TokensV2 == nil || c.Session == nil || c.Tools == nil ||
+		c.CodeActivity == nil || c.Conversation == nil || c.AgentsAndSkills == nil ||
+		c.Redactions == nil || c.Workflows == nil {
+		return time.Time{}, false
+	}
+	// IsValid(own UpToLine) == "present at the current version".
+	stamps := []struct {
+		currentVersion bool
+		computedAt     time.Time
+	}{
+		{c.TokensV2.IsValid(c.TokensV2.UpToLine), c.TokensV2.ComputedAt},
+		{c.Session.IsValid(c.Session.UpToLine), c.Session.ComputedAt},
+		{c.Tools.IsValid(c.Tools.UpToLine), c.Tools.ComputedAt},
+		{c.CodeActivity.IsValid(c.CodeActivity.UpToLine), c.CodeActivity.ComputedAt},
+		{c.Conversation.IsValid(c.Conversation.UpToLine), c.Conversation.ComputedAt},
+		{c.AgentsAndSkills.IsValid(c.AgentsAndSkills.UpToLine), c.AgentsAndSkills.ComputedAt},
+		{c.Redactions.IsValid(c.Redactions.UpToLine), c.Redactions.ComputedAt},
+		{c.Workflows.IsValid(c.Workflows.UpToLine), c.Workflows.ComputedAt},
+	}
+	oldestComputedAt = stamps[0].computedAt
+	for _, s := range stamps {
+		if !s.currentVersion {
+			return time.Time{}, false
+		}
+		if s.computedAt.Before(oldestComputedAt) {
+			oldestComputedAt = s.computedAt
+		}
+	}
+	return oldestComputedAt, true
 }

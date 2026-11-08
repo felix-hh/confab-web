@@ -56,7 +56,7 @@ const KNOWN_OPENCODE_PART_TYPES = new Set([
 // JSONL parsing
 // ============================================================================
 
-export interface OpenCodeParseResult {
+interface OpenCodeParseResult {
   rawLines: OpenCodeRawEntry[];
   /** Count of non-empty lines (including those that failed to parse), so the
    *  line-offset incremental fetch stays in sync with the file. */
@@ -130,8 +130,9 @@ function usageFromTokens(line: RawOpenCodeLine): TokenUsage | undefined {
   let input = t.input ?? 0;
   let cacheWrite = t.cache?.write ?? 0;
   // Mirror the backend's per-provider normalization (opencode_compute.go): OpenAI
-  // bills cached input as a subset of `input` and never charges cache writes, so
-  // the pricing-table cost fallback matches the backend's number.
+  // bills cached input as a subset of `input`, and its cache writes are zeroed
+  // because the wire carries no trustworthy count (md0z) — not because the rate
+  // is zero — so the pricing-table cost fallback matches the backend's number.
   if (line.info.providerID === 'openai') {
     input = Math.max(0, input - cacheRead);
     cacheWrite = 0;
@@ -287,7 +288,7 @@ async function fetchWithCache(
   return entry;
 }
 
-export interface ParsedOpenCodeTranscript {
+interface ParsedOpenCodeTranscript {
   sessionId: string;
   items: OpenCodeRenderItem[];
   rawLines: OpenCodeRawEntry[];

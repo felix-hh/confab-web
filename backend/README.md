@@ -61,7 +61,6 @@ See [`API.md`](API.md) for the full REST reference. Quick links:
 - **[SECURITY.md](SECURITY.md)** - Complete security guide (authentication, CORS, CSRF, input validation, headers)
 - **[PERFORMANCE.md](PERFORMANCE.md)** - Performance optimization guide (rate limiting, compression, monitoring)
 - **[TEST.md](TEST.md)** - Testing guide
-- **[TODO.md](TODO.md)** - Future improvements and roadmap
 
 ## Database Schema
 
@@ -75,7 +74,8 @@ Backend targets (run from `backend/`, or via the root `Makefile`):
 make test       # go test ./...
 make coverage   # sharded coverage (see internal/testutil/README.md)
 make build      # build the binary
-make fmt        # gofmt
+make fmt        # gofmt + go fix
+make fmt-check  # CI format gate (gofmt + go fix -diff)
 ```
 
 ## License

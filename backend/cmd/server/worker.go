@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"os"
 	"os/signal"
 	"strconv"
@@ -14,13 +15,7 @@ import (
 	"github.com/ConfabulousDev/confab-web/internal/logger"
 	"github.com/ConfabulousDev/confab-web/internal/pricingsource"
 	"github.com/ConfabulousDev/confab-web/internal/storage"
-	"github.com/honeycombio/otel-config-go/otelconfig"
-	"go.opentelemetry.io/otel"
-	"go.opentelemetry.io/otel/attribute"
-	"go.opentelemetry.io/otel/codes"
 )
-
-var workerTracer = otel.Tracer("confab/worker")
 
 // WorkerConfig holds configuration for the analytics precompute worker.
 type WorkerConfig struct {
@@ -41,6 +36,8 @@ type precomputerAPI interface {
 	PrecomputeRegularCards(ctx context.Context, session analytics.StaleSession) error
 	PrecomputeSmartRecapOnly(ctx context.Context, session analytics.StaleSession) error
 	BuildSearchIndexOnly(ctx context.Context, session analytics.StaleSession) error
+	FindTitleRecomputeSessions(ctx context.Context, limit int) ([]analytics.StaleSession, error)
+	RecomputeSessionTitle(ctx context.Context, session analytics.StaleSession) error
 }
 
 // Worker is the background analytics precompute worker.
@@ -48,32 +45,14 @@ type Worker struct {
 	db            *db.DB
 	store         *storage.S3Storage
 	precomputer   precomputerAPI
+	failures      precomputeFailureTracker
 	config        WorkerConfig
 	pricingSource *pricingsource.Source // refreshes the active price table each cycle
-
-	// recapFailures counts consecutive smart-recap failures per session ID.
-	// Sessions at or above maxRecapFailures are skipped: a failed generation
-	// writes nothing, so the session stays "stale" forever and would otherwise
-	// be retried with a full-transcript LLM call on every sweep. In-memory by
-	// design — a worker restart grants every session a fresh set of attempts.
-	recapFailures map[string]int
 }
-
-// maxRecapFailures is the number of consecutive failures after which a
-// session's smart recap is no longer attempted (until the worker restarts).
-const maxRecapFailures = 3
 
 // runWorker is the entry point for the background worker process.
 func runWorker() {
 	logger.Info("starting analytics precompute worker")
-
-	// Initialize OpenTelemetry (same as server)
-	otelShutdown, err := otelconfig.ConfigureOpenTelemetry()
-	if err != nil {
-		logger.Warn("failed to configure OpenTelemetry for worker", "error", err)
-	} else {
-		defer otelShutdown()
-	}
 
 	// Load worker configuration
 	workerConfig := loadWorkerConfig()
@@ -115,6 +94,7 @@ func runWorker() {
 	precomputeConfig := loadPrecomputeConfig()
 	logger.Info("smart recap configuration",
 		"enabled", precomputeConfig.SmartRecapEnabled,
+		"llm_provider", precomputeConfig.SmartRecapLLMProvider,
 		"model", precomputeConfig.SmartRecapModel,
 		"quota", precomputeConfig.SmartRecapQuota,
 	)
@@ -129,9 +109,9 @@ func runWorker() {
 		db:            database,
 		store:         store,
 		precomputer:   precomputer,
+		failures:      analyticsStore,
 		config:        workerConfig,
 		pricingSource: pricingsource.NewFromEnv(os.Getenv("ENABLE_SAAS_FOOTER") == "true"),
-		recapFailures: make(map[string]int),
 	}
 
 	// Setup graceful shutdown
@@ -146,6 +126,13 @@ func runWorker() {
 		logger.Info("shutdown signal received, stopping worker")
 		cancel()
 	}()
+
+	// Count attempts a previous process left unsettled (crash, OOM, hard kill)
+	// before the first cycle can pick the same sessions again. Skipped in
+	// dry-run, which never claims attempts.
+	if !workerConfig.DryRun {
+		worker.sweepCrashedAttempts(ctx)
+	}
 
 	// Run the worker
 	worker.Run(ctx)
@@ -171,13 +158,12 @@ func (w *Worker) Run(ctx context.Context) {
 }
 
 // runOnce executes a single precomputation cycle.
-// It processes two independent buckets:
+// It processes four independent buckets:
 // 1. Sessions with stale regular cards (computes regular cards only)
 // 2. Sessions with stale smart recap but fresh regular cards (computes smart recap only)
+// 3. Sessions with a stale search index
+// 4. Sessions marked for session-title recompute by an admin invalidation (nbrd)
 func (w *Worker) runOnce(ctx context.Context) {
-	ctx, span := workerTracer.Start(ctx, "worker.run_once")
-	defer span.End()
-
 	logger.Info("starting precomputation cycle")
 
 	// Refresh the active price table (best-effort, lazily cached behind a short
@@ -193,13 +179,11 @@ func (w *Worker) runOnce(ctx context.Context) {
 		deleted, err := (&access.Store{DB: w.db}).DeleteExpiredShares(ctx, w.config.ShareRetention)
 		if err != nil {
 			logger.Error("failed to delete expired shares", "error", err)
-			span.RecordError(err)
 		} else if deleted > 0 {
 			logger.Info("deleted expired shares",
 				"count", deleted,
 				"retention", w.config.ShareRetention,
 			)
-			span.SetAttributes(attribute.Int64("shares.deleted", deleted))
 		}
 	}
 
@@ -207,8 +191,6 @@ func (w *Worker) runOnce(ctx context.Context) {
 	regularSessions, err := w.precomputer.FindStaleSessions(ctx, w.config.MaxSessions)
 	if err != nil {
 		logger.Error("failed to find stale sessions", "error", err)
-		span.RecordError(err)
-		span.SetStatus(codes.Error, err.Error())
 		return
 	}
 
@@ -216,8 +198,6 @@ func (w *Worker) runOnce(ctx context.Context) {
 	smartRecapSessions, err := w.precomputer.FindStaleSmartRecapSessions(ctx, w.config.MaxSessions)
 	if err != nil {
 		logger.Error("failed to find stale smart recap sessions", "error", err)
-		span.RecordError(err)
-		span.SetStatus(codes.Error, err.Error())
 		return
 	}
 
@@ -225,19 +205,19 @@ func (w *Worker) runOnce(ctx context.Context) {
 	searchIndexSessions, err := w.precomputer.FindStaleSearchIndexSessions(ctx, w.config.MaxSearchIndexSessions)
 	if err != nil {
 		logger.Error("failed to find stale search index sessions", "error", err)
-		span.RecordError(err)
-		span.SetStatus(codes.Error, err.Error())
 		return
 	}
 
-	totalFound := len(regularSessions) + len(smartRecapSessions) + len(searchIndexSessions)
+	// Bucket 4: Find sessions marked for session-title recompute
+	titleSessions, err := w.precomputer.FindTitleRecomputeSessions(ctx, w.config.MaxSessions)
+	if err != nil {
+		logger.Error("failed to find session title recompute sessions", "error", err)
+		return
+	}
+
+	totalFound := len(regularSessions) + len(smartRecapSessions) + len(searchIndexSessions) + len(titleSessions)
 	if totalFound == 0 {
 		logger.Info("no stale sessions found")
-		span.SetAttributes(
-			attribute.Int("sessions.regular.found", 0),
-			attribute.Int("sessions.smart_recap.found", 0),
-			attribute.Int("sessions.search_index.found", 0),
-		)
 		return
 	}
 
@@ -245,11 +225,7 @@ func (w *Worker) runOnce(ctx context.Context) {
 		"regular_cards", len(regularSessions),
 		"smart_recap_only", len(smartRecapSessions),
 		"search_index_only", len(searchIndexSessions),
-	)
-	span.SetAttributes(
-		attribute.Int("sessions.regular.found", len(regularSessions)),
-		attribute.Int("sessions.smart_recap.found", len(smartRecapSessions)),
-		attribute.Int("sessions.search_index.found", len(searchIndexSessions)),
+		"session_title", len(titleSessions),
 	)
 
 	// In dry-run mode, just log what would be processed and return
@@ -278,16 +254,19 @@ func (w *Worker) runOnce(ctx context.Context) {
 				"total_lines", session.TotalLines,
 			)
 		}
+		for _, session := range titleSessions {
+			logger.Info("[DRY-RUN] would recompute session title",
+				"session_id", session.SessionID,
+				"user_id", session.UserID,
+				"external_id", session.ExternalID,
+				"provider", session.Provider,
+			)
+		}
 		logger.Info("[DRY-RUN] precomputation cycle complete",
 			"would_process_regular", len(regularSessions),
 			"would_process_smart_recap", len(smartRecapSessions),
 			"would_process_search_index", len(searchIndexSessions),
-		)
-		span.SetAttributes(
-			attribute.Bool("dry_run", true),
-			attribute.Int("sessions.regular.would_process", len(regularSessions)),
-			attribute.Int("sessions.smart_recap.would_process", len(smartRecapSessions)),
-			attribute.Int("sessions.search_index.would_process", len(searchIndexSessions)),
+			"would_process_session_title", len(titleSessions),
 		)
 		return
 	}
@@ -301,6 +280,9 @@ func (w *Worker) runOnce(ctx context.Context) {
 	// Process Bucket 3: Sessions with stale search index
 	searchIndexProcessed, searchIndexErrors := w.processSearchIndexSessions(ctx, searchIndexSessions)
 
+	// Process Bucket 4: Sessions marked for session-title recompute
+	titleProcessed, titleErrors := w.processTitleRecomputeSessions(ctx, titleSessions)
+
 	logger.Info("precomputation cycle complete",
 		"regular_processed", regularProcessed,
 		"regular_errors", regularErrors,
@@ -308,65 +290,45 @@ func (w *Worker) runOnce(ctx context.Context) {
 		"smart_recap_errors", smartRecapErrors,
 		"search_index_processed", searchIndexProcessed,
 		"search_index_errors", searchIndexErrors,
-	)
-	span.SetAttributes(
-		attribute.Int("sessions.regular.processed", regularProcessed),
-		attribute.Int("sessions.regular.errors", regularErrors),
-		attribute.Int("sessions.smart_recap.processed", smartRecapProcessed),
-		attribute.Int("sessions.smart_recap.errors", smartRecapErrors),
-		attribute.Int("sessions.search_index.processed", searchIndexProcessed),
-		attribute.Int("sessions.search_index.errors", searchIndexErrors),
+		"session_title_processed", titleProcessed,
+		"session_title_errors", titleErrors,
 	)
 }
 
 // processRegularSessions processes sessions with stale regular cards.
 func (w *Worker) processRegularSessions(ctx context.Context, sessions []analytics.StaleSession) (processed, errors int) {
-	return w.processSessions(ctx, sessions, "session", w.precomputer.PrecomputeRegularCards, 500*time.Millisecond)
+	return w.processSessions(ctx, sessions, analytics.BucketRegularCards, "session", w.precomputer.PrecomputeRegularCards, 500*time.Millisecond)
 }
 
 // processSmartRecapSessions processes sessions with only stale smart recap.
-// Sessions that have failed maxRecapFailures times in a row are skipped so a
-// deterministic failure can't burn an LLM call every sweep forever.
 func (w *Worker) processSmartRecapSessions(ctx context.Context, sessions []analytics.StaleSession) (processed, errors int) {
-	eligible := make([]analytics.StaleSession, 0, len(sessions))
-	for _, s := range sessions {
-		if w.recapFailures[s.SessionID] >= maxRecapFailures {
-			logger.Warn("skipping smart recap: too many consecutive failures",
-				"session_id", s.SessionID,
-				"external_id", s.ExternalID,
-				"failures", w.recapFailures[s.SessionID],
-			)
-			continue
-		}
-		eligible = append(eligible, s)
-	}
-	return w.processSessions(ctx, eligible, "smart recap", func(ctx context.Context, s analytics.StaleSession) error {
-		err := w.precomputer.PrecomputeSmartRecapOnly(ctx, s)
-		if err == nil {
-			delete(w.recapFailures, s.SessionID)
-		} else if err != analytics.ErrQuotaExceeded && ctx.Err() == nil {
-			// Count only real generation failures — not quota skips, and not
-			// context cancellation from a shutdown mid-request.
-			w.recapFailures[s.SessionID]++
-		}
-		return err
-	}, 500*time.Millisecond)
+	return w.processSessions(ctx, sessions, analytics.BucketSmartRecap, "smart recap", w.precomputer.PrecomputeSmartRecapOnly, 500*time.Millisecond)
 }
 
 // processSearchIndexSessions processes sessions with stale search index.
 func (w *Worker) processSearchIndexSessions(ctx context.Context, sessions []analytics.StaleSession) (processed, errors int) {
-	return w.processSessions(ctx, sessions, "search index", w.precomputer.BuildSearchIndexOnly, 50*time.Millisecond)
+	return w.processSessions(ctx, sessions, analytics.BucketSearchIndex, "search index", w.precomputer.BuildSearchIndexOnly, 50*time.Millisecond)
+}
+
+// processTitleRecomputeSessions re-derives first_user_message for sessions marked
+// by a session_title invalidation.
+func (w *Worker) processTitleRecomputeSessions(ctx context.Context, sessions []analytics.StaleSession) (processed, errors int) {
+	return w.processSessions(ctx, sessions, analytics.BucketSessionTitle, "session title", w.precomputer.RecomputeSessionTitle, 50*time.Millisecond)
 }
 
 // processSessions is a generic loop that processes a list of stale sessions with pacing.
-// The label parameter is used for log messages (e.g., "session" or "smart recap").
+// bucket keys the per-session failure tracking (6kbe); label is used for log
+// messages (e.g., "session" or "smart recap"). Every attempt is claimed before
+// it runs and settled after, so repeated failures quarantine the session from
+// this bucket and a crash mid-attempt is counted by the startup sweep.
 func (w *Worker) processSessions(
 	ctx context.Context,
 	sessions []analytics.StaleSession,
+	bucket string,
 	label string,
 	process func(context.Context, analytics.StaleSession) error,
 	pacing time.Duration,
-) (processed, errors int) {
+) (processed, errCount int) {
 	for i, session := range sessions {
 		select {
 		case <-ctx.Done():
@@ -375,23 +337,11 @@ func (w *Worker) processSessions(
 		default:
 		}
 
+		w.claimAttempt(ctx, session, bucket)
 		err := process(ctx, session)
+		w.settleAttempt(ctx, session, bucket, label, err)
 		if err != nil {
-			if err == analytics.ErrQuotaExceeded {
-				logger.Warn("skipped precompute "+label+": quota exceeded",
-					"session_id", session.SessionID,
-					"user_id", session.UserID,
-				)
-			} else {
-				logger.Error("failed to precompute "+label,
-					"session_id", session.SessionID,
-					"user_id", session.UserID,
-					"external_id", session.ExternalID,
-					"total_lines", session.TotalLines,
-					"error", err,
-				)
-			}
-			errors++
+			errCount++
 		} else {
 			logger.Info("precomputed "+label,
 				"session_id", session.SessionID,
@@ -412,6 +362,101 @@ func (w *Worker) processSessions(
 		}
 	}
 	return
+}
+
+// precomputeFailureTracker is the failure-tracking surface the worker uses.
+// *analytics.Store satisfies it in production; tests pass a fake.
+type precomputeFailureTracker interface {
+	ClaimAttempt(ctx context.Context, sessionID, bucket string) error
+	RecordSuccess(ctx context.Context, sessionID, bucket string) error
+	RecordFailure(ctx context.Context, sessionID, bucket, errMsg string) (attempts int, quarantined bool, err error)
+	ReleaseAttempt(ctx context.Context, sessionID, bucket string) error
+	SweepCrashedAttempts(ctx context.Context) (int, error)
+}
+
+// bookkeepingTimeout bounds each failure-tracking write.
+const bookkeepingTimeout = 5 * time.Second
+
+// bookkeepingCtx returns a context for a failure-tracking write that survives
+// shutdown: the attempt has to be settled even when ctx was just canceled.
+func bookkeepingCtx(ctx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.WithoutCancel(ctx), bookkeepingTimeout)
+}
+
+// claimAttempt marks the attempt in progress. Best-effort: a failure is logged
+// and the session is still processed.
+func (w *Worker) claimAttempt(ctx context.Context, session analytics.StaleSession, bucket string) {
+	bctx, cancel := bookkeepingCtx(ctx)
+	defer cancel()
+	if err := w.failures.ClaimAttempt(bctx, session.SessionID, bucket); err != nil {
+		logger.Error("failed to claim precompute attempt",
+			"session_id", session.SessionID, "bucket", bucket, "error", err)
+	}
+}
+
+// settleAttempt records the outcome of one attempt and logs it. Quota exceeded
+// and shutdown release the claim without counting a failure. Bookkeeping
+// errors are logged and never abort the cycle.
+func (w *Worker) settleAttempt(ctx context.Context, session analytics.StaleSession, bucket, label string, procErr error) {
+	bctx, cancel := bookkeepingCtx(ctx)
+	defer cancel()
+
+	var err error
+	switch {
+	case procErr == nil:
+		err = w.failures.RecordSuccess(bctx, session.SessionID, bucket)
+	case errors.Is(procErr, analytics.ErrQuotaExceeded):
+		logger.Warn("skipped precompute "+label+": quota exceeded",
+			"session_id", session.SessionID,
+			"user_id", session.UserID,
+		)
+		err = w.failures.ReleaseAttempt(bctx, session.SessionID, bucket)
+	case ctx.Err() != nil || errors.Is(procErr, context.Canceled):
+		logger.Info("precompute "+label+" interrupted by shutdown",
+			"session_id", session.SessionID,
+			"error", procErr,
+		)
+		err = w.failures.ReleaseAttempt(bctx, session.SessionID, bucket)
+	default:
+		attempts, quarantined, recErr := w.failures.RecordFailure(bctx, session.SessionID, bucket, procErr.Error())
+		err = recErr
+		logger.Error("failed to precompute "+label,
+			"session_id", session.SessionID,
+			"user_id", session.UserID,
+			"external_id", session.ExternalID,
+			"total_lines", session.TotalLines,
+			"attempts", attempts,
+			"error", procErr,
+		)
+		if recErr == nil && quarantined {
+			logger.Warn("session quarantined from precompute",
+				"session_id", session.SessionID,
+				"bucket", bucket,
+				"attempts", attempts,
+				"last_error", procErr.Error(),
+			)
+		}
+	}
+	if err != nil {
+		logger.Error("failed to record precompute attempt outcome",
+			"session_id", session.SessionID, "bucket", bucket, "error", err)
+	}
+}
+
+// sweepCrashedAttempts counts attempts a previous worker process never settled
+// (it crashed or was killed mid-attempt) as failures. It must run before the
+// first cycle and relies on the worker being a single process (fly.toml runs
+// one worker machine): with two workers, one's in-flight claims would be
+// counted as the other's crashes. Best-effort; a failure is logged.
+func (w *Worker) sweepCrashedAttempts(ctx context.Context) {
+	n, err := w.failures.SweepCrashedAttempts(ctx)
+	if err != nil {
+		logger.Error("failed to sweep crashed precompute attempts", "error", err)
+		return
+	}
+	if n > 0 {
+		logger.Warn("counted crashed precompute attempts as failures", "count", n)
+	}
 }
 
 // loadWorkerConfig loads worker configuration from environment variables.
@@ -496,11 +541,16 @@ func loadS3Config() storage.S3Config {
 
 // loadPrecomputeConfig loads smart recap configuration from environment variables.
 func loadPrecomputeConfig() analytics.PrecomputeConfig {
+	llmConfig, err := analytics.ResolveSmartRecapLLMConfig(os.Getenv)
+	if err != nil {
+		logFatal("invalid smart recap configuration", "error", err)
+	}
 	config := analytics.PrecomputeConfig{
-		SmartRecapEnabled:  os.Getenv("SMART_RECAP_ENABLED") == "true",
-		AnthropicAPIKey:    os.Getenv("ANTHROPIC_API_KEY"),
-		SmartRecapModel:    os.Getenv("SMART_RECAP_MODEL"),
-		LockTimeoutSeconds: 60,
+		SmartRecapEnabled:     os.Getenv("SMART_RECAP_ENABLED") == "true",
+		SmartRecapLLMProvider: llmConfig.Provider,
+		SmartRecapAPIKey:      llmConfig.APIKey,
+		SmartRecapModel:       llmConfig.Model,
+		LockTimeoutSeconds:    60,
 	}
 
 	// Parse quota limit: positive integer = cap, 0 or omitted = unlimited
@@ -539,7 +589,11 @@ func loadPrecomputeConfig() analytics.PrecomputeConfig {
 	)
 
 	// Disable if required config is missing (quota=0 means unlimited, not disabled)
-	if config.AnthropicAPIKey == "" || config.SmartRecapModel == "" {
+	if llmConfig.MissingVar != "" {
+		if config.SmartRecapEnabled {
+			logger.Warn("smart recap disabled: missing env var",
+				"var", llmConfig.MissingVar, "llm_provider", llmConfig.Provider)
+		}
 		config.SmartRecapEnabled = false
 	}
 

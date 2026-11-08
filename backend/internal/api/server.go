@@ -1,7 +1,6 @@
 package api
 
 import (
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -18,6 +17,7 @@ import (
 	"github.com/ConfabulousDev/confab-web/internal/db"
 	dbuser "github.com/ConfabulousDev/confab-web/internal/db/user"
 	"github.com/ConfabulousDev/confab-web/internal/email"
+	"github.com/ConfabulousDev/confab-web/internal/httputil"
 	"github.com/ConfabulousDev/confab-web/internal/logger"
 	"github.com/ConfabulousDev/confab-web/internal/pricingsource"
 	"github.com/ConfabulousDev/confab-web/internal/ratelimit"
@@ -68,7 +68,6 @@ type Server struct {
 	sharesEnabled       bool                      // When true, share creation is enabled (ENABLE_SHARE_CREATION=true)
 	shareDailyQuota     int                       // Per-user rolling-24h cap on share creation (SHARE_DAILY_QUOTA, default 100; <=0 disables)
 	saasFooterEnabled   bool                      // When true, SaaS footer is shown (ENABLE_SAAS_FOOTER=true)
-	saasTermlyEnabled   bool                      // When true, Termly cookie consent is enabled (ENABLE_SAAS_TERMLY=true)
 	orgAnalyticsEnabled bool                      // When true, org-wide analytics view is enabled (ENABLE_ORG_ANALYTICS=true)
 	smartRecapEnabled   bool                      // When true, smart recap generation is active (SMART_RECAP_ENABLED=true)
 	globalLimiter       ratelimit.RateLimiter     // Global rate limiter for all requests
@@ -104,7 +103,6 @@ func NewServer(database *db.DB, store *storage.S3Storage, oauthConfig *auth.OAut
 		sharesEnabled:       os.Getenv("ENABLE_SHARE_CREATION") == "true",
 		shareDailyQuota:     shareDailyQuotaFromEnv(),
 		saasFooterEnabled:   saasFooterEnabled,
-		saasTermlyEnabled:   os.Getenv("ENABLE_SAAS_TERMLY") == "true",
 		orgAnalyticsEnabled: os.Getenv("ENABLE_ORG_ANALYTICS") == "true",
 		smartRecapEnabled:   os.Getenv("SMART_RECAP_ENABLED") == "true",
 		// Global rate limiter: 100 requests per second, burst of 200
@@ -146,7 +144,7 @@ func parseAllowedOrigins() ([]string, []string) {
 	var trustedOrigins []string
 
 	originsEnv := os.Getenv("ALLOWED_ORIGINS")
-	for _, origin := range strings.Split(originsEnv, ",") {
+	for origin := range strings.SplitSeq(originsEnv, ",") {
 		trimmed := strings.TrimSpace(origin)
 		if trimmed == "" || trimmed == "*" {
 			continue
@@ -168,7 +166,7 @@ func parseAllowedOrigins() ([]string, []string) {
 // headers from other sources are ignored.
 func parseTrustedProxyHeaders() []string {
 	var headers []string
-	for _, h := range strings.Split(os.Getenv("TRUSTED_PROXY_HEADERS"), ",") {
+	for h := range strings.SplitSeq(os.Getenv("TRUSTED_PROXY_HEADERS"), ",") {
 		if trimmed := strings.TrimSpace(h); trimmed != "" {
 			headers = append(headers, trimmed)
 		}
@@ -193,15 +191,13 @@ func (s *Server) SetupRoutes() http.Handler {
 	r.Use(ratelimit.Middleware(s.globalLimiter))
 	// 4. RequestID: assign unique ID for request tracing (used by FlyLogger)
 	r.Use(middleware.RequestID)
-	// 5. SpanEnricher: add CLI version/os/arch to OpenTelemetry span
-	r.Use(SpanEnricher)
-	// 6. Request-scoped logger: adds req_id to all logs within the request
+	// 5. Request-scoped logger: adds req_id to all logs within the request
 	r.Use(logger.Middleware)
-	// 7. Redirects and security headers
+	// 6. Redirects and security headers
 	r.Use(wwwRedirectMiddleware())
 	r.Use(securityHeadersMiddleware())
 
-	// 8. Compression: Brotli (preferred) + gzip (fallback)
+	// 7. Compression: Brotli (preferred) + gzip (fallback)
 	// Brotli provides 15-25% better compression than gzip for JSON
 	// Serves Brotli to modern clients (95%+), gzip to legacy clients
 	compressor := middleware.NewCompressor(5) // gzip level 5 (baseline)
@@ -211,7 +207,7 @@ func (s *Server) SetupRoutes() http.Handler {
 	})
 	r.Use(compressor.Handler)
 
-	// 9. FlyLogger: AFTER compressor so it captures uncompressed response bodies
+	// 8. FlyLogger: AFTER compressor so it captures uncompressed response bodies
 	r.Use(FlyLogger)
 
 	// CORS configuration - CRITICAL SECURITY FIX
@@ -302,7 +298,7 @@ func (s *Server) SetupRoutes() http.Handler {
 	// but sit OUTSIDE the CSRF group below; guard them with the Fetch-Metadata
 	// cross-origin check (covers the state-changing GET that the CSRF library
 	// skips). Reuses trustedOrigins.
-	r.Get("/auth/cli/authorize", withMaxBody(MaxBodyXS, crossOriginGuard(trustedOrigins, ratelimit.HandlerFunc(s.authLimiter, auth.HandleCLIAuthorize(s.db)))))
+	r.Get("/auth/cli/authorize", withMaxBody(MaxBodyXS, crossOriginGuard(trustedOrigins, ratelimit.HandlerFunc(s.authLimiter, auth.HandleCLIAuthorize(s.db, s.oauthConfig.AllowedEmailDomains)))))
 
 	// Device code flow (for CLI on headless/remote machines)
 	backendURL := os.Getenv("BACKEND_URL")
@@ -457,6 +453,12 @@ func (s *Server) SetupRoutes() http.Handler {
 				// active pricing table — surfaces a newly-released unpriced model
 				// without grepping the "unknown model for pricing" WARN logs.
 				r.Get("/unpriced-models", withMaxBody(MaxBodyXS, adminHandlers.HandleUnpricedModels))
+
+				// 6kbe: sessions the worker quarantined after repeated precompute
+				// failures, with per-row and bulk release.
+				r.Get("/precompute-failures", withMaxBody(MaxBodyXS, adminHandlers.HandleListPrecomputeFailures))
+				r.Post("/precompute-failures/release", withMaxBody(MaxBodyXS, adminHandlers.HandleReleasePrecomputeFailure))
+				r.Post("/precompute-failures/release-all", withMaxBody(MaxBodyXS, adminHandlers.HandleReleaseAllPrecomputeFailures))
 			})
 		})
 
@@ -683,7 +685,7 @@ func (s *Server) handleValidateAPIKey(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	respondJSON(w, http.StatusOK, map[string]interface{}{
+	respondJSON(w, http.StatusOK, map[string]any{
 		"valid":   true,
 		"user_id": user.ID,
 		"email":   user.Email,
@@ -705,29 +707,17 @@ func (s *Server) serveSPA(staticDir string) http.HandlerFunc {
 	// Clean staticDir once during initialization for security check
 	cleanStaticDir := filepath.Clean(staticDir)
 
-	// Pre-process index.html at startup: inject Termly script + demo banner
-	// state hook if enabled. Done once at boot so per-request serving is
-	// just a Write. Both injections land before </head>; we build the
-	// combined block first so we touch the source string at most once.
+	// Pre-process index.html at startup: inject the demo banner state hook
+	// before </head> if enabled. Done once at boot so per-request serving is
+	// just a Write.
 	indexPath := filepath.Join(cleanStaticDir, "index.html")
 	var processedIndex []byte
 	if raw, err := os.ReadFile(indexPath); err == nil {
-		var headInject strings.Builder
-		if s.saasTermlyEnabled {
-			headInject.WriteString(`    <!-- Termly Consent Banner -->
-    <script src="https://app.termly.io/resource-blocker/6f350df0-f6a8-4213-b299-da2516ace3ac?autoBlock=on"></script>
-`)
-		}
+		processed := string(raw)
 		// CF-483: RenderDemoBannerScriptTag returns "" when DemoIdentityEmail
 		// is unset, so this is a no-op in non-demo deployments.
 		if demoScript := auth.RenderDemoBannerScriptTag(s.oauthConfig.DemoIdentityEmail); demoScript != "" {
-			headInject.WriteString("    ")
-			headInject.WriteString(demoScript)
-			headInject.WriteString("\n")
-		}
-		processed := string(raw)
-		if headInject.Len() > 0 {
-			processed = strings.Replace(processed, "</head>", headInject.String()+"  </head>", 1)
+			processed = strings.Replace(processed, "</head>", "    "+demoScript+"\n  </head>", 1)
 		}
 		processedIndex = []byte(processed)
 	}
@@ -772,7 +762,7 @@ func (s *Server) serveSPA(staticDir string) http.HandlerFunc {
 			// Hashed assets - cache for 1 year (immutable)
 			w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
 		} else if requestPath == "/" || requestPath == "/index.html" {
-			// Always serve processed index.html (may have Termly injected)
+			// Always serve processed index.html (may have the demo hook injected)
 			serveIndex(w, r)
 			return
 		}
@@ -783,18 +773,13 @@ func (s *Server) serveSPA(staticDir string) http.HandlerFunc {
 }
 
 // respondJSON writes a JSON response
-func respondJSON(w http.ResponseWriter, status int, data interface{}) {
-	w.Header().Set("Content-Type", "application/json")
-	w.Header().Set("Cache-Control", "no-store")
-	w.WriteHeader(status)
-	json.NewEncoder(w).Encode(data)
+func respondJSON(w http.ResponseWriter, status int, data any) {
+	httputil.RespondJSON(w, status, data)
 }
 
 // respondError writes an error JSON response
 func respondError(w http.ResponseWriter, status int, message string) {
-	respondJSON(w, status, map[string]string{
-		"error": message,
-	})
+	httputil.RespondError(w, status, message)
 }
 
 // respondStorageError returns an appropriate error response based on the storage error type
@@ -829,7 +814,6 @@ func requireUserID(w http.ResponseWriter, r *http.Request) (int64, bool) {
 func securityHeadersMiddleware() func(http.Handler) http.Handler {
 	staticDir := os.Getenv("STATIC_FILES_DIR")
 	servingStatic := staticDir != ""
-	saasTermlyEnabled := os.Getenv("ENABLE_SAAS_TERMLY") == "true"
 
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -839,13 +823,8 @@ func securityHeadersMiddleware() func(http.Handler) http.Handler {
 				// Relaxed CSP for SPA frontend: allows inline scripts needed for SPA bootstrap
 				// - script-src 'self' 'unsafe-inline': Allow inline scripts (React apps may need this)
 				// - style-src 'self' 'unsafe-inline': Allow inline styles
-				if saasTermlyEnabled {
-					w.Header().Set("Content-Security-Policy",
-						"default-src 'self'; script-src 'self' 'unsafe-inline' https://app.termly.io; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; img-src 'self' data: https:; font-src 'self' https://fonts.gstatic.com; connect-src 'self' https://*.termly.io; frame-src https://app.termly.io; frame-ancestors 'none'")
-				} else {
-					w.Header().Set("Content-Security-Policy",
-						"default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; img-src 'self' data: https:; font-src 'self' https://fonts.gstatic.com; connect-src 'self'; frame-ancestors 'none'")
-				}
+				w.Header().Set("Content-Security-Policy",
+					"default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; font-src 'self'; connect-src 'self'; frame-ancestors 'none'")
 			} else {
 				// Strict CSP for API-only mode
 				// - script-src 'self': Only execute scripts from same origin
@@ -892,9 +871,9 @@ func wwwRedirectMiddleware() func(http.Handler) http.Handler {
 				host = host[:colonIdx]
 			}
 
-			if strings.HasPrefix(host, "www.") {
+			if after, ok := strings.CutPrefix(host, "www."); ok {
 				// Build redirect URL with apex domain
-				newHost := strings.TrimPrefix(host, "www.")
+				newHost := after
 				// Preserve port if original request had one
 				if colonIdx := strings.LastIndex(r.Host, ":"); colonIdx != -1 {
 					newHost += r.Host[colonIdx:]

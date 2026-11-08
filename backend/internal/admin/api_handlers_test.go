@@ -3,6 +3,7 @@ package admin_test
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -14,6 +15,8 @@ import (
 	"github.com/ConfabulousDev/confab-web/internal/admin"
 	"github.com/ConfabulousDev/confab-web/internal/api"
 	"github.com/ConfabulousDev/confab-web/internal/auth"
+	"github.com/ConfabulousDev/confab-web/internal/db"
+	"github.com/ConfabulousDev/confab-web/internal/db/dbauth"
 	dbuser "github.com/ConfabulousDev/confab-web/internal/db/user"
 	"github.com/ConfabulousDev/confab-web/internal/logger"
 	"github.com/ConfabulousDev/confab-web/internal/models"
@@ -74,7 +77,7 @@ func TestGetMe_IsAdmin(t *testing.T) {
 
 		testutil.RequireStatus(t, resp, http.StatusOK)
 
-		var body map[string]interface{}
+		var body map[string]any
 		testutil.ParseJSON(t, resp, &body)
 		if body["is_admin"] != true {
 			t.Errorf("expected is_admin=true, got %v", body["is_admin"])
@@ -96,7 +99,7 @@ func TestGetMe_IsAdmin(t *testing.T) {
 
 		testutil.RequireStatus(t, resp, http.StatusOK)
 
-		var body map[string]interface{}
+		var body map[string]any
 		testutil.ParseJSON(t, resp, &body)
 		if body["is_admin"] != false {
 			t.Errorf("expected is_admin=false, got %v", body["is_admin"])
@@ -122,7 +125,7 @@ func TestAdminAPI_AuthEnforcement(t *testing.T) {
 	endpoints := []struct {
 		method string
 		path   string
-		body   interface{}
+		body   any
 	}{
 		{"GET", "/api/v1/admin/users", nil},
 		{"POST", "/api/v1/admin/users", emptyBody},
@@ -427,6 +430,54 @@ func TestAdminCreateUserAPI(t *testing.T) {
 			t.Fatalf("request failed: %v", err)
 		}
 		testutil.RequireStatus(t, resp, http.StatusBadRequest)
+	})
+
+	t.Run("rejects 73-byte password with 400 and creates no user", func(t *testing.T) {
+		env.CleanDB(t)
+
+		adminUser := testutil.CreateTestUser(t, env, "admin@example.com", "Admin")
+		testutil.SetEnvForTest(t, "SUPER_ADMIN_EMAILS", "admin@example.com")
+
+		ts := setupTestServer(t, env)
+		client := adminClient(t, env, ts, adminUser.ID)
+
+		resp, err := client.Post("/api/v1/admin/users", map[string]string{
+			"email":    "newuser@example.com",
+			"password": strings.Repeat("a", 73),
+		})
+		if err != nil {
+			t.Fatalf("request failed: %v", err)
+		}
+		testutil.RequireStatus(t, resp, http.StatusBadRequest)
+
+		var body map[string]string
+		testutil.ParseJSON(t, resp, &body)
+		if want := "Password must be at most 72 bytes"; body["error"] != want {
+			t.Errorf("expected error %q, got %q", want, body["error"])
+		}
+
+		if _, err := (&dbauth.Store{DB: env.DB}).GetUserByEmail(t.Context(), "newuser@example.com"); !errors.Is(err, db.ErrUserNotFound) {
+			t.Errorf("expected no user row for rejected password, got err=%v", err)
+		}
+	})
+
+	t.Run("accepts 72-byte multibyte password", func(t *testing.T) {
+		env.CleanDB(t)
+
+		adminUser := testutil.CreateTestUser(t, env, "admin@example.com", "Admin")
+		testutil.SetEnvForTest(t, "SUPER_ADMIN_EMAILS", "admin@example.com")
+
+		ts := setupTestServer(t, env)
+		client := adminClient(t, env, ts, adminUser.ID)
+
+		resp, err := client.Post("/api/v1/admin/users", map[string]string{
+			"email":    "newuser@example.com",
+			"password": strings.Repeat("🔥", 18), // 18 runes, 72 bytes
+		})
+		if err != nil {
+			t.Fatalf("request failed: %v", err)
+		}
+		testutil.RequireStatus(t, resp, http.StatusOK)
 	})
 
 	t.Run("rejects invalid email", func(t *testing.T) {
@@ -1430,7 +1481,7 @@ func TestAdminUnion_ColumnAdminGetsAccess(t *testing.T) {
 			t.Fatalf("request failed: %v", err)
 		}
 		testutil.RequireStatus(t, resp, http.StatusOK)
-		var body map[string]interface{}
+		var body map[string]any
 		testutil.ParseJSON(t, resp, &body)
 		if body["is_admin"] != true {
 			t.Errorf("expected is_admin=true for column admin, got %v", body["is_admin"])

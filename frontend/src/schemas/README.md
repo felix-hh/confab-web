@@ -33,7 +33,7 @@ All types are inferred from Zod schemas via `z.infer<>`:
 
 **Trends types:**
 - `TrendsResponse` -- Aggregated analytics with date range, repo, provider, and owner (CF-495) filters. Includes top-level `filter_options.{owners,repos}` for dropdown sources (CF-495).
-- `TrendsFilterOptions` -- Owner + repo dropdown source. Static across active filter changes (mirrors `SessionFilterOptions`).
+- `TrendsResponse.filter_options` (internal `TrendsFilterOptionsSchema`) -- Owner + repo + model dropdown source. Static across active filter changes (mirrors `SessionFilterOptions`).
 - Card types: `TrendsOverviewCard`, `TrendsTokensCard`, `TrendsActivityCard`, `TrendsToolsCard`, `TrendsUtilizationCard`, `TrendsAgentsAndSkillsCard`, `TrendsTopSessionsCard`
 
 **Org types:**
@@ -53,7 +53,7 @@ All types are inferred from Zod schemas via `z.infer<>`:
 - `UnknownBlock` -- Forward-compatibility catch-all
 
 **Message types** (discriminated union on `type`):
-- `UserMessage` -- User prompts and tool results. Its `toolUseResult` sibling validates against `ToolUseResultSchema`: a union of `string`, the typed `BashToolResultSchema` (CC ≥ 2.1.143 Bash fields — `stdout`/`stderr`/`exitCode`/`interrupted`/`isImage`/`noOutputExpected`/`returnCodeInterpretation`/`persistedOutputPath`/`persistedOutputSize`, all optional, `.passthrough()`), `unknown[]`, and an open `z.record` catch-all (last). The typed Bash variant is exported as `BashToolResult`.
+- `UserMessage` -- User prompts and tool results. Its `toolUseResult` sibling validates against `ToolUseResultSchema`: a union of `string`, the typed `BashToolResultSchema` (CC ≥ 2.1.143 Bash fields — `stdout`/`stderr`/`exitCode`/`interrupted`/`isImage`/`noOutputExpected`/`returnCodeInterpretation`/`persistedOutputPath`/`persistedOutputSize`, all optional, `.passthrough()`), `unknown[]`, and an open `z.record` catch-all (last). The typed Bash variant is exported as `BashToolResult`. `ArtifactToolResultSchema` / `ArtifactToolResult` (not part of the union — parsed separately by `ClaudeTimelineMessage`) models the claude.ai `Artifact` tool's result: `url`/`title`/`path`/`seq`/`updated` plus nested `read` / `file_read` refs, all optional, `.passthrough()`.
 - `AssistantMessage` -- Claude responses with token usage
 - Both `UserMessage` and `AssistantMessage` carry an optional inline `permissionMode` (CC ≥ 2.1.143). It is five-valued — `default | acceptEdits | bypassPermissions | plan | auto` (`auto` is the risk-evaluating mode added in 2.1.143) — but modeled as `z.string().optional()`, not `z.enum`, so a future upstream mode keeps validating.
 - `SystemMessage` -- System events (compact_boundary, api_error, turn_duration, away_summary, `informational`, etc.). The `informational` subtype (CC ≥ 2.1.143) is the once-per-entry onboarding banner — e.g. the "auto mode" notice — carrying an optional `level` ('info' | 'warning' | 'error'); the frontend renders it via `InformationalBanner`.
@@ -78,17 +78,18 @@ All types are inferred from Zod schemas via `z.infer<>`:
 ### codexTranscript.ts -- Codex Rollout Types
 
 Each on-disk Codex line has the envelope `{ timestamp, type, payload }`.
-`RawCodexLineSchema` is a `z.union` of the five known top-level branches
-(`session_meta`, `turn_context`, `response_item`, `event_msg`, `compacted`)
-plus a catch-all `CodexUnknownLineSchema` so unfamiliar future types parse
-without erroring.
+`RawCodexLineSchema` is a `z.union` of the seven known top-level branches
+(`session_meta`, `turn_context`, `response_item`, `event_msg`, `compacted`,
+`token_usage_record` — pnkh, `world_state` — zgd6) plus a catch-all
+`CodexUnknownLineSchema` so unfamiliar future types parse without erroring.
 
 **Top-level inferred types:**
 - `RawCodexLine` -- union of all branches (catch-all included)
 - `CodexResponseItemLine`, `CodexEventMsgLine` -- the two branches the
-  normalizer destructures; the other three (`session_meta`,
-  `turn_context`, `compacted`) parse through `RawCodexLine` but their
-  per-branch types are local to the schema module.
+  normalizer destructures; the other five (`session_meta`,
+  `turn_context`, `compacted`, `token_usage_record`, `world_state`) parse
+  through `RawCodexLine` but their per-branch types are local to the schema
+  module.
 
 **Nested payload variants:**
 - `response_item.payload` is a union with seven known shapes
@@ -97,9 +98,22 @@ without erroring.
   `web_search_call`) plus a catch-all. `CodexResponseMessage` is the
   only exported branch type (used by the normalizer); the others are
   composed via schema unions and don't need exported aliases.
-- `event_msg.payload` is a union with six known shapes
-  (`user_message`, `agent_message`, `task_started`, `task_complete`,
-  `token_count`, `patch_apply_end`) plus a catch-all.
+- `event_msg.payload` is a union with twenty known shapes plus a catch-all,
+  split three ways per Codex's own `should_persist_event_msg` rollout policy
+  (px58 — only these 20 of Codex's 81 `EventMsg` variants can ever reach a
+  rollout file; the other 61 are transient/in-memory and stay unmodeled on
+  purpose, so an unexpected one appearing is a real forward-compat signal):
+  - **Render** (6): `task_started`, `task_complete`, `token_count`,
+    `turn_aborted`, `patch_apply_end`, `mcp_tool_call_end`.
+  - **Recognized but silent** (14 — parsed as a known shape, produce zero
+    render items so they never surface as a "Unrecognized line"
+    `CodexUnknownItem`): `user_message`, `agent_message`, `web_search_end`,
+    `context_compacted`, `item_completed` (pnkh), plus px58's
+    `thread_settings_applied`, `thread_goal_updated`, `thread_rolled_back`,
+    `agent_reasoning`, `agent_reasoning_raw_content`, `sub_agent_activity`,
+    `entered_review_mode`, `exited_review_mode`, `image_generation_end`.
+  - **Genuinely unrecognized**: everything else falls to the catch-all.
+
   `CodexTokenUsageDetails` (CF-362 — typed `info.last_token_usage` /
   `info.total_token_usage` shape) is exported and consumed by the
   normalizer to attach per-call usage to assistant render items.

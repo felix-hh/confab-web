@@ -2,6 +2,7 @@ package analytics_test
 
 import (
 	"context"
+	"slices"
 	"sort"
 	"testing"
 	"time"
@@ -1043,7 +1044,7 @@ func TestGetTrends_TopSessions(t *testing.T) {
 			Version:    analytics.SessionCardVersion,
 			ComputedAt: time.Now().UTC(),
 			UpToLine:   100,
-			DurationMs: int64Ptr(3600000), // 1 hour
+			DurationMs: new(int64(3600000)), // 1 hour
 		},
 	})
 	if err != nil {
@@ -1276,10 +1277,6 @@ func TestGetTrends_TopSessions_PerProvider(t *testing.T) {
 			t.Errorf("sessions[%d].Provider = %q, want %q (%s)", c.index, got.Provider, c.wantProvider, label)
 		}
 	}
-}
-
-func int64Ptr(v int64) *int64 {
-	return &v
 }
 
 // TestGetTrends_ProviderFilter (CF-424) covers the wire and SQL semantics
@@ -1658,8 +1655,9 @@ func TestGetTrends_TokensPerProvider_LegacyAliasFold(t *testing.T) {
 // behavior of the Activity card when a mixed Claude + Codex window is in play:
 //
 //   - Files Modified / Lines Added / Lines Removed accumulate from BOTH providers.
-//   - Files Read accumulates from Claude only (Codex has no Read tool — its
-//     CodeActivity rows always carry FilesRead=0 by design).
+//   - Files Read accumulates from Claude only here, because this fixture's
+//     Codex rows are <=0.130.0 sessions, which record no parsed_cmd and so
+//     carry FilesRead=0. >=0.149.1 Codex sessions do contribute reads (m2ky).
 //   - DailySessionCounts[i].PerProvider exposes a canonical-id-keyed map per day
 //     so the frontend can render stacked bars (mirrors DailyCostPoint.PerProvider
 //     from the Tokens card).
@@ -1816,7 +1814,7 @@ func TestGetTrends_CodexOnlyFilesReadZero(t *testing.T) {
 		t.Fatal("Activity card must be non-nil")
 	}
 	if got := resp.Cards.Activity.TotalFilesRead; got != 0 {
-		t.Errorf("TotalFilesRead = %d, want 0 (Codex has no Read tool)", got)
+		t.Errorf("TotalFilesRead = %d, want 0 (<=0.130.0 Codex rollouts report no reads)", got)
 	}
 	if got, want := resp.Cards.Activity.TotalFilesModified, 3; got != want {
 		t.Errorf("TotalFilesModified = %d, want %d", got, want)
@@ -2154,7 +2152,7 @@ func TestGetTrends_TopSessionsLimit(t *testing.T) {
 	// Seed 30 priced sessions with strictly descending costs so ordering and
 	// limit boundaries are unambiguous. Session i has cost (30 - i).
 	const seeded = 30
-	for i := 0; i < seeded; i++ {
+	for i := range seeded {
 		name := "topn-session-" + decimal.NewFromInt(int64(i)).String()
 		sid := testutil.CreateTestSession(t, env, user.ID, name)
 		if err := store.UpsertCards(ctx, &analytics.Cards{TokensV2: v2TokensCard(sid, 1000, 500, 0, 0, float64(seeded-i))}); err != nil {
@@ -2219,12 +2217,7 @@ func TestGetTrends_TopSessionsLimit(t *testing.T) {
 }
 
 func trendsContainsStr(haystack []string, needle string) bool {
-	for _, s := range haystack {
-		if s == needle {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(haystack, needle)
 }
 
 // TestGetTrends_FilterOptions_ExcludesNonListable (0407) asserts the Trends

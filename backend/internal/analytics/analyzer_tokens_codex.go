@@ -2,7 +2,6 @@ package analytics
 
 import (
 	"log/slog"
-	"time"
 
 	"github.com/ConfabulousDev/confab-web/internal/codex"
 	"github.com/ConfabulousDev/confab-web/internal/models"
@@ -16,11 +15,12 @@ import (
 //   - ReasoningOutputTokens is a subset of OutputTokens (CF-471); the wire's
 //     output_tokens already includes reasoning, so we surface it unchanged.
 //     Reasoning bills at the output rate implicitly.
-//   - CacheCreationTokens stays 0; OpenAI doesn't charge for cache writes.
+//   - CacheCreationTokens stays 0 because the rollout wire carries no cache-write
+//     count, not because the rate is zero: the 5.6 and 6 families do carry a real
+//     cache-write rate in pricing.json (md0z tracks surfacing the tokens).
 //
-// Pricing uses the main rollout's model. sessionAt is forwarded to pricingForModel
-// for date-aware pricing; zero value routes to introductory rates (before Sep 1 2026).
-func computeCodexTokens(log *slog.Logger, out *ComputeResult, rollouts []*codex.ParsedRollout, sessionAt time.Time) {
+// Pricing uses the main rollout's model.
+func computeCodexTokens(log *slog.Logger, out *ComputeResult, rollouts []*codex.ParsedRollout) {
 	var totalUncached, totalCached, totalOutput int64
 
 	// Per-model accumulation for tokens_v2, grouped by model family with
@@ -34,10 +34,7 @@ func computeCodexTokens(log *slog.Logger, out *ComputeResult, rollouts []*codex.
 			continue
 		}
 		tu := r.TokenUsage
-		uncached := tu.InputTokens - tu.CachedInputTokens
-		if uncached < 0 {
-			uncached = 0
-		}
+		uncached := max(tu.InputTokens-tu.CachedInputTokens, 0)
 		totalUncached += uncached
 		totalCached += tu.CachedInputTokens
 		totalOutput += tu.OutputTokens
@@ -45,7 +42,7 @@ func computeCodexTokens(log *slog.Logger, out *ComputeResult, rollouts []*codex.
 		family := getModelFamily(r.Model)
 		pricing, ok := pricingByFamily[family]
 		if !ok {
-			pricing = pricingForModel(log, r.Model, sessionAt)
+			pricing = pricingForModel(log, r.Model)
 			pricingByFamily[family] = pricing
 		}
 		agg := byModel[family]
@@ -57,8 +54,9 @@ func computeCodexTokens(log *slog.Logger, out *ComputeResult, rollouts []*codex.
 		agg.output += tu.OutputTokens
 		agg.cacheRead += tu.CachedInputTokens
 		agg.reasoning += tu.ReasoningOutputTokens
-		// Cache writes stay 0 (OpenAI bills none); reasoning is a subset of output
-		// (CF-471), so it bills implicitly at the output rate — not added here.
+		// Cache writes stay 0 (no count on the wire — see the header comment);
+		// reasoning is a subset of output (CF-471), so it bills implicitly at the
+		// output rate and is not added here.
 		agg.cost = agg.cost.Add(CalculateCost(pricing, uncached, tu.OutputTokens, 0, tu.CachedInputTokens))
 	}
 
@@ -71,7 +69,7 @@ func computeCodexTokens(log *slog.Logger, out *ComputeResult, rollouts []*codex.
 	if len(rollouts) > 0 && rollouts[0] != nil {
 		pricingModel = rollouts[0].Model
 	}
-	pricing := pricingForModel(log, pricingModel, sessionAt)
+	pricing := pricingForModel(log, pricingModel)
 	out.EstimatedCostUSD = CalculateCost(
 		pricing,
 		out.InputTokens,

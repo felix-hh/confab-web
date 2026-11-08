@@ -3,6 +3,7 @@ package auth
 import (
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 )
@@ -459,7 +460,7 @@ func TestGenerateUserCode(t *testing.T) {
 		// Confusing chars: 0, O, I, L, 1
 		safeChars := "ABCDEFGHJKMNPQRSTUVWXYZ23456789"
 
-		for i := 0; i < 100; i++ {
+		for range 100 {
 			code, err := generateUserCode()
 			if err != nil {
 				t.Fatalf("generateUserCode failed: %v", err)
@@ -479,7 +480,7 @@ func TestGenerateUserCode(t *testing.T) {
 
 	t.Run("generates unique codes", func(t *testing.T) {
 		codes := make(map[string]bool)
-		for i := 0; i < 100; i++ {
+		for range 100 {
 			code, err := generateUserCode()
 			if err != nil {
 				t.Fatalf("generateUserCode failed: %v", err)
@@ -499,7 +500,7 @@ func TestGenerateUserCode(t *testing.T) {
 		const chars = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"
 		counts := make(map[rune]int)
 		const iterations = 20000 // 160,000 sampled symbols
-		for i := 0; i < iterations; i++ {
+		for range iterations {
 			code, err := generateUserCode()
 			if err != nil {
 				t.Fatalf("generateUserCode failed: %v", err)
@@ -553,7 +554,7 @@ func TestGenerateDeviceCode(t *testing.T) {
 
 	t.Run("generates unique codes", func(t *testing.T) {
 		codes := make(map[string]bool)
-		for i := 0; i < 100; i++ {
+		for range 100 {
 			code, err := generateDeviceCode()
 			if err != nil {
 				t.Fatalf("generateDeviceCode failed: %v", err)
@@ -785,6 +786,36 @@ func TestHandleLogout_RedirectSupport(t *testing.T) {
 			t.Errorf("location contains evil.com - open redirect vulnerability: %s", location)
 		}
 	})
+
+	// Logout shares resolvePostLoginRedirect with login: only /auth, /auth/...
+	// and /auth?... are backend paths, and backslash/control-char values fall back
+	// to the frontend root.
+	logoutCases := []struct {
+		name, redirect, want string
+	}{
+		{"/authors is a frontend path", "/authors", "http://localhost:3000/authors"},
+		{"/device is a frontend path", "/device", "http://localhost:3000/device"},
+		{"bare /auth is a backend path", "/auth", "/auth"},
+		{"backslash bypass falls back to frontend root", "/\\evil.com", "http://localhost:3000"},
+		{"control char falls back to frontend root", "/sessions\x00", "http://localhost:3000"},
+	}
+	for _, tc := range logoutCases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("FRONTEND_URL", "http://localhost:3000")
+			handler := HandleLogout(nil, &OAuthConfig{})
+			req := httptest.NewRequest("GET", "/auth/logout?redirect="+url.QueryEscape(tc.redirect), nil)
+			rec := httptest.NewRecorder()
+
+			handler.ServeHTTP(rec, req)
+
+			if rec.Code != http.StatusTemporaryRedirect {
+				t.Errorf("status = %d, want 307", rec.Code)
+			}
+			if location := rec.Header().Get("Location"); location != tc.want {
+				t.Errorf("location = %q, want %q", location, tc.want)
+			}
+		})
+	}
 }
 
 func containsRune(s string, r rune) bool {

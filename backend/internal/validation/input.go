@@ -113,6 +113,25 @@ func ValidateFirstUserMessage(msg string) error {
 	return nil
 }
 
+// TruncateToByteLimit clips s to at most limit bytes, cutting on a rune
+// boundary so the result stays valid UTF-8. Values already within the limit —
+// and any limit <= 0 — are returned unchanged.
+//
+// This is for values the server derives itself and must fit into a column
+// rather than reject: rejecting a server-derived value would drop data the
+// client never had a chance to shorten. Client-supplied input is still
+// validated and refused by the Validate* functions above.
+func TruncateToByteLimit(s string, limit int) string {
+	if limit <= 0 || len(s) <= limit {
+		return s
+	}
+	cut := limit
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	return s[:cut]
+}
+
 // ValidateAPIKeyName validates an API key name
 func ValidateAPIKeyName(name string) error {
 	if len(name) > MaxAPIKeyNameLength {
@@ -254,17 +273,22 @@ func ValidateCodexRolloutMetadata(
 	if threadUUID == "" {
 		return fmt.Errorf("thread_uuid is required")
 	}
-	if _, err := uuid.Parse(threadUUID); err != nil {
+	tid, err := uuid.Parse(threadUUID)
+	if err != nil {
 		return fmt.Errorf("thread_uuid must be a valid UUID")
 	}
 	if parentThreadUUID != nil {
 		if *parentThreadUUID == "" {
 			return fmt.Errorf("parent_thread_uuid must not be empty when provided (omit the field for root rollouts)")
 		}
-		if _, err := uuid.Parse(*parentThreadUUID); err != nil {
+		pid, err := uuid.Parse(*parentThreadUUID)
+		if err != nil {
 			return fmt.Errorf("parent_thread_uuid must be a valid UUID")
 		}
-		if *parentThreadUUID == threadUUID {
+		// Compare parsed values, not strings: every spelling uuid.Parse accepts
+		// (case, raw hex, URN, braces) names one UUID, and the UUID columns
+		// store the spellings Postgres accepts as that same value (wmet).
+		if pid == tid {
 			return fmt.Errorf("parent_thread_uuid must not equal thread_uuid")
 		}
 	}

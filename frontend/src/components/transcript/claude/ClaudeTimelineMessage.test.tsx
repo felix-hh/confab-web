@@ -1,21 +1,35 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
-import type { UserMessage, AssistantMessage, TranscriptLine } from '@/types';
+import type { UserMessage, AssistantMessage, TranscriptLine, UnknownMessage } from '@/types';
 import ClaudeTimelineMessage from './ClaudeTimelineMessage';
+import { buildClaudeAgentIndex } from './claudeAgentIndex';
+import { ClaudeThreadContext } from './claudeThreadContext';
+import {
+  agentToolUse,
+  asyncAgentResult,
+  taskNotificationMessage,
+  subagentAssistantText,
+} from '@/test-fixtures/claudeSubagent';
 
-// Mock the useCopyToClipboard hook to capture copied text
+// Mock the useCopyToClipboard hook to capture copied text; keep the rest of
+// the barrel real (btxt: unknown-message rows render ReportUnknownButton,
+// which needs the real useAppConfig/AppConfigContext default).
 const copiedTexts: string[] = [];
-vi.mock('@/hooks', () => ({
-  useCopyToClipboard: () => ({
-    copy: (text: string) => {
-      copiedTexts.push(text);
-      return Promise.resolve();
-    },
-    copied: copiedTexts.length > 0,
-    message: null,
-  }),
-}));
+vi.mock('@/hooks', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@/hooks')>();
+  return {
+    ...actual,
+    useCopyToClipboard: () => ({
+      copy: (text: string) => {
+        copiedTexts.push(text);
+        return Promise.resolve();
+      },
+      copied: copiedTexts.length > 0,
+      message: null,
+    }),
+  };
+});
 
 function createUserMessage(overrides: Partial<UserMessage> = {}): UserMessage {
   return {
@@ -61,6 +75,16 @@ function createAssistantMessage(overrides: Partial<AssistantMessage> = {}): Assi
         output_tokens: 50,
       },
     },
+    ...overrides,
+  };
+}
+
+function createUnknownMessage(overrides: Partial<UnknownMessage> = {}): UnknownMessage {
+  return {
+    type: 'agent-handoff',
+    fromAgent: 'agent-1',
+    toAgent: 'agent-2',
+    timestamp: '2025-01-15T10:00:00Z',
     ...overrides,
   };
 }
@@ -537,6 +561,163 @@ describe('ClaudeTimelineMessage', () => {
       );
 
       expect(screen.queryByText(/tok\/s/)).not.toBeInTheDocument();
+    });
+  });
+
+  // UNKNOWN rows show the raw JSON payload behind a click-to-expand <details>,
+  // matching the convenience Codex/OpenCode rows get from UnknownRawDetails
+  // (without reusing that shell — this row has its own header chrome).
+  describe('unknown message raw JSON', () => {
+    function getRawJsonDetails(): HTMLElement | null {
+      return screen.getByText('Raw JSON').closest('details');
+    }
+
+    it('renders a collapsed "Raw JSON" details alongside the report button', () => {
+      const message = createUnknownMessage();
+      render(
+        <ClaudeTimelineMessage
+          message={message}
+          toolNameMap={emptyToolNameMap}
+        />
+      );
+
+      expect(getRawJsonDetails()).not.toHaveAttribute('open');
+      expect(screen.getByText('Report bug')).toBeInTheDocument();
+    });
+
+    it('shows the raw JSON payload text once expanded', async () => {
+      const user = userEvent.setup();
+      const message = createUnknownMessage({ fromAgent: 'agent-1', toAgent: 'agent-2' });
+      render(
+        <ClaudeTimelineMessage
+          message={message}
+          toolNameMap={emptyToolNameMap}
+        />
+      );
+
+      await user.click(screen.getByText('Raw JSON'));
+
+      expect(screen.getByText(/"fromAgent"/)).toBeInTheDocument();
+      expect(screen.getByText(/"agent-1"/)).toBeInTheDocument();
+    });
+
+    it('auto-opens the details when this row is the active search match', () => {
+      const message = createUnknownMessage({ fromAgent: 'agent-1' });
+      render(
+        <ClaudeTimelineMessage
+          message={message}
+          toolNameMap={emptyToolNameMap}
+          searchQuery="agent-1"
+          isCurrentSearchMatch={true}
+        />
+      );
+
+      expect(getRawJsonDetails()).toHaveAttribute('open');
+    });
+
+    it('does not render the raw JSON details for known message types', () => {
+      const message = createUserMessage();
+      render(
+        <ClaudeTimelineMessage
+          message={message}
+          toolNameMap={emptyToolNameMap}
+        />
+      );
+
+      expect(screen.queryByText('Raw JSON')).not.toBeInTheDocument();
+    });
+  });
+
+  // et0r: Agent tool results and agent completion notifications render as
+  // subagent cards linking to the subagent's own transcript subtab.
+  describe('subagent cards', () => {
+    const launchLines: TranscriptLine[] = [
+      agentToolUse({ uuid: 'u1', toolUseId: 't1', description: 'Explore the codebase', subagentType: 'Explore' }),
+      asyncAgentResult({ uuid: 'r1', toolUseId: 't1', agentId: 'a1', description: 'Explore the codebase' }),
+    ];
+
+    function withThreads(
+      ui: React.ReactElement,
+      { onOpenThread, activeThreadId = null, lines = launchLines }: {
+        onOpenThread?: (id: string) => void;
+        activeThreadId?: string | null;
+        lines?: TranscriptLine[];
+      } = {},
+    ) {
+      return render(
+        <ClaudeThreadContext.Provider
+          value={{ agentIndex: buildClaudeAgentIndex(lines), onOpenThread, activeThreadId }}
+        >
+          {ui}
+        </ClaudeThreadContext.Provider>,
+      );
+    }
+
+    const toolNameMap = new Map([['t1', 'Agent']]);
+
+    it('renders a launch card in place of the Agent tool_result block', async () => {
+      const user = userEvent.setup();
+      const onOpenThread = vi.fn();
+      withThreads(<ClaudeTimelineMessage message={launchLines[1]!} toolNameMap={toolNameMap} />, { onOpenThread });
+
+      expect(screen.getByText('Explore the codebase')).toBeInTheDocument();
+      expect(screen.getByText('Raw result')).toBeInTheDocument();
+      await user.click(screen.getByRole('button', { name: 'Open transcript →' }));
+      expect(onOpenThread).toHaveBeenCalledWith('a1');
+    });
+
+    it('renders the Agent tool_result as a plain block when no thread context is provided', () => {
+      render(<ClaudeTimelineMessage message={launchLines[1]!} toolNameMap={toolNameMap} />);
+      expect(screen.queryByText('Raw result')).not.toBeInTheDocument();
+    });
+
+    it('renders a finished card for an agent <task-notification> message', () => {
+      const notification = taskNotificationMessage('n1', {
+        taskId: 'a1',
+        summary: 'Agent "Explore the codebase" finished',
+      });
+      withThreads(<ClaudeTimelineMessage message={notification} toolNameMap={emptyToolNameMap} />, {
+        lines: [...launchLines, notification],
+        onOpenThread: () => {},
+      });
+      expect(screen.getByText('Subagent finished')).toBeInTheDocument();
+      expect(screen.getByText('Agent "Explore the codebase" finished')).toBeInTheDocument();
+      expect(screen.getByText('Raw notification')).toBeInTheDocument();
+    });
+
+    it('leaves background-command task notifications (unknown task id) as plain text', () => {
+      const notification = taskNotificationMessage('n1', {
+        taskId: 'bash-task',
+        toolUseId: 'toolu_bash',
+        summary: 'Background command "Build" completed (exit code 0)',
+      });
+      withThreads(<ClaudeTimelineMessage message={notification} toolNameMap={emptyToolNameMap} />, {
+        lines: [...launchLines, notification],
+      });
+      expect(screen.queryByText('Subagent finished')).not.toBeInTheDocument();
+    });
+
+    it('hides the agentId badge inside the agent\'s own thread', () => {
+      const line = subagentAssistantText('s1', 'a1', 'working');
+      const { unmount } = withThreads(<ClaudeTimelineMessage message={line} toolNameMap={emptyToolNameMap} />, {
+        activeThreadId: 'a1',
+      });
+      expect(screen.queryByText('a1')).not.toBeInTheDocument();
+      unmount();
+
+      withThreads(<ClaudeTimelineMessage message={line} toolNameMap={emptyToolNameMap} />, { activeThreadId: null });
+      expect(screen.getByText('a1')).toBeInTheDocument();
+    });
+
+    it('copy-link includes the agent param inside a subagent thread', async () => {
+      const user = userEvent.setup();
+      const line = subagentAssistantText('s1', 'a1', 'working');
+      withThreads(
+        <ClaudeTimelineMessage message={line} toolNameMap={emptyToolNameMap} sessionId="session-abc" />,
+        { activeThreadId: 'a1' },
+      );
+      await user.click(screen.getByLabelText('Copy link to message'));
+      expect(copiedTexts[0]).toMatch(/\?tab=transcript&msg=s1&agent=a1$/);
     });
   });
 });

@@ -216,7 +216,7 @@ func TestGetSessionAnalytics_HTTP_Integration(t *testing.T) {
 		}
 	})
 
-	t.Run("invalidates cache when new data is synced", func(t *testing.T) {
+	t.Run("serves stale cards with the old computed_lines after new data is synced", func(t *testing.T) {
 		env.CleanDB(t)
 
 		user := testutil.CreateTestUser(t, env, "test@example.com", "Test User")
@@ -258,7 +258,11 @@ func TestGetSessionAnalytics_HTTP_Integration(t *testing.T) {
 		// Update sync_files to reflect new line count (CreateTestSyncFile uses ON CONFLICT DO UPDATE)
 		testutil.CreateTestSyncFile(t, env, sessionID, "transcript.jsonl", "transcript", 2)
 
-		// Second request - cache should be invalid (line count mismatch), recompute
+		// Second request - the cached cards lag the line count but are at the
+		// current version, and younger than the refresh cooldown, so they are
+		// served as-is. computed_lines (1) < total lines (2) keeps the client
+		// polling with as_of_line. The background refresh is covered in
+		// analytics_cache_http_integration_test.go.
 		resp2, err := client.Get(fmt.Sprintf("/api/v1/sessions/%s/analytics", sessionID))
 		if err != nil {
 			t.Fatalf("request 2 failed: %v", err)
@@ -269,12 +273,11 @@ func TestGetSessionAnalytics_HTTP_Integration(t *testing.T) {
 		var result2 analytics.AnalyticsResponse
 		testutil.ParseJSON(t, resp2, &result2)
 
-		// Should reflect NEW data (100 + 200 = 300 input tokens)
-		if result2.Tokens.Input != 300 {
-			t.Errorf("expected updated input tokens 300, got %d", result2.Tokens.Input)
+		if result2.Tokens.Input != 100 {
+			t.Errorf("expected stale input tokens 100, got %d", result2.Tokens.Input)
 		}
-		if result2.ComputedLines != 2 {
-			t.Errorf("expected computed_lines 2, got %d", result2.ComputedLines)
+		if result2.ComputedLines != 1 {
+			t.Errorf("expected stale computed_lines 1, got %d", result2.ComputedLines)
 		}
 	})
 
@@ -497,7 +500,7 @@ func TestGetSessionAnalytics_HTTP_Integration(t *testing.T) {
 //   - tokens.cache_creation = 0     (OpenAI doesn't charge for cache writes)
 //   - tokens.cache_read     = 200   (cached portion)
 //   - code_activity.files_modified = 1 (one Add File)
-//   - code_activity.files_read     = 0 (Codex has no Read tool)
+//   - code_activity.files_read     = 0 (<=0.130.0 rollout: no parsed_cmd, m2ky)
 //   - code_activity.lines_added    = 3 (the three +-prefixed lines)
 const codexExactFixture = `{"timestamp":"2026-05-13T01:00:00.000Z","type":"session_meta","payload":{"id":"019e-test-aaaa-bbbb-cccc-dddddddddddd","timestamp":"2026-05-13T01:00:00.000Z","cwd":"/test","originator":"codex-tui","cli_version":"0.130.0","source":"cli","thread_source":"user","model_provider":"openai","model":"gpt-5"}}
 {"timestamp":"2026-05-13T01:00:00.100Z","type":"turn_context","payload":{"turn_id":"t1","cwd":"/test","approval_policy":"on-request"}}
@@ -642,12 +645,12 @@ func TestGetSessionAnalytics_Codex_HTTP_Integration_Exact(t *testing.T) {
 	if !ok {
 		t.Fatal("Cards[\"code_activity\"] missing")
 	}
-	codeActivity, ok := codeActivityRaw.(map[string]interface{})
+	codeActivity, ok := codeActivityRaw.(map[string]any)
 	if !ok {
 		t.Fatalf("Cards[\"code_activity\"] = %T, want map[string]interface{}", codeActivityRaw)
 	}
 	if got := jsonNumber(codeActivity["files_read"]); got != 0 {
-		t.Errorf("code_activity.files_read = %d, want 0 (no Read tool in codex)", got)
+		t.Errorf("code_activity.files_read = %d, want 0 (<=0.130.0 rollout: no parsed_cmd)", got)
 	}
 	if got := jsonNumber(codeActivity["files_modified"]); got != 1 {
 		t.Errorf("code_activity.files_modified = %d, want 1", got)
@@ -662,7 +665,7 @@ func TestGetSessionAnalytics_Codex_HTTP_Integration_Exact(t *testing.T) {
 
 // jsonNumber unwraps a JSON-decoded number (float64 from encoding/json) to int64.
 // Returns -1 for missing or non-numeric fields so test errors are obvious.
-func jsonNumber(v interface{}) int64 {
+func jsonNumber(v any) int64 {
 	switch n := v.(type) {
 	case float64:
 		return int64(n)
@@ -723,7 +726,7 @@ func TestGetSessionAnalytics_Codex_HTTP_Integration_AgentsAndSkills(t *testing.T
 	if !ok {
 		t.Fatal("Cards[\"agents_and_skills\"] missing for Codex session with spawns")
 	}
-	payload, ok := raw.(map[string]interface{})
+	payload, ok := raw.(map[string]any)
 	if !ok {
 		t.Fatalf("Cards[\"agents_and_skills\"] = %T, want map[string]interface{}", raw)
 	}
@@ -733,7 +736,7 @@ func TestGetSessionAnalytics_Codex_HTTP_Integration_AgentsAndSkills(t *testing.T
 	if got := jsonNumber(payload["skill_invocations"]); got != 0 {
 		t.Errorf("skill_invocations = %d, want 0 (fixture has no skills)", got)
 	}
-	agentStats, ok := payload["agent_stats"].(map[string]interface{})
+	agentStats, ok := payload["agent_stats"].(map[string]any)
 	if !ok {
 		t.Fatalf("agent_stats = %T, want map (keyed by agent_role)", payload["agent_stats"])
 	}
@@ -744,8 +747,8 @@ func TestGetSessionAnalytics_Codex_HTTP_Integration_AgentsAndSkills(t *testing.T
 	}
 	// Tools card must NOT contain spawn_agent / wait_agent.
 	if toolsRaw, ok := result.Cards["tools"]; ok {
-		if toolsCard, ok := toolsRaw.(map[string]interface{}); ok {
-			if ts, ok := toolsCard["tool_stats"].(map[string]interface{}); ok {
+		if toolsCard, ok := toolsRaw.(map[string]any); ok {
+			if ts, ok := toolsCard["tool_stats"].(map[string]any); ok {
 				if _, present := ts["spawn_agent"]; present {
 					t.Error("tools.tool_stats[spawn_agent] present — should be routed to AgentsAndSkills only")
 				}
@@ -757,7 +760,7 @@ func TestGetSessionAnalytics_Codex_HTTP_Integration_AgentsAndSkills(t *testing.T
 	}
 }
 
-func mapKeys(m map[string]interface{}) []string {
+func mapKeys(m map[string]any) []string {
 	out := make([]string, 0, len(m))
 	for k := range m {
 		out = append(out, k)

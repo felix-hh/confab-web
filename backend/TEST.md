@@ -3,7 +3,7 @@
 ## Prerequisites
 
 - Docker / Orbstack (integration tests run Postgres + MinIO in containers)
-- Go 1.26+
+- Go 1.27+
 
 ## Running Tests
 
@@ -67,4 +67,6 @@ docker compose -f docker-compose.infra.yml exec postgres psql -U confab -d confa
 make coverage
 ```
 
-Runs sharded coverage via [`scripts/coverage.sh`](scripts/coverage.sh).
+Runs the full suite one package at a time via [`scripts/coverage.sh`](scripts/coverage.sh) with `-coverpkg=./internal/...`, writes the merged profile to `coverage.out`, and ends with a per-package coverage table. To print that table for an existing profile without running tests: `COVERAGE_SUMMARY_ONLY=coverage.out ./scripts/coverage.sh`.
+
+Use this (or your own `-coverpkg` run) rather than `go test -cover ./...`. Plain `-cover` credits a package only with its own tests, so it under-reports packages exercised from other packages — e.g. `internal/api`, whose HTTP integration tests live in subpackages.

@@ -94,6 +94,33 @@ func handleCLIRedirect(w http.ResponseWriter, r *http.Request, statusCode int) b
 	return false
 }
 
+// resolvePostLoginRedirect validates an explicit post-login (or post-logout)
+// redirect target and returns the absolute-or-backend URL to send the user to.
+// It returns ("", false) for an empty or unsafe value; callers fall back to
+// their default destination.
+//
+// SECURITY: this is the single open-redirect gate for every login/logout
+// redirect. Rules:
+//   - must start with "/" and not "//" (no absolute or protocol-relative URLs);
+//   - no "\" anywhere (browsers normalize "/\evil.com" to "//evil.com");
+//   - no ASCII control characters (< 0x20, 0x7f);
+//   - "/auth", "/auth/..." and "/auth?..." are backend paths, returned as-is;
+//   - every other path is a frontend path, prefixed with frontendURL.
+func resolvePostLoginRedirect(raw, frontendURL string) (string, bool) {
+	if !strings.HasPrefix(raw, "/") || strings.HasPrefix(raw, "//") {
+		return "", false
+	}
+	for i := 0; i < len(raw); i++ {
+		if c := raw[i]; c == '\\' || c < 0x20 || c == 0x7f {
+			return "", false
+		}
+	}
+	if raw == "/auth" || strings.HasPrefix(raw, "/auth/") || strings.HasPrefix(raw, "/auth?") {
+		return raw, true
+	}
+	return frontendURL + raw, true
+}
+
 // checkExpectedEmailMismatch reads the expected_email cookie and checks if the
 // user's actual email matches. Returns the expected email and whether there was
 // a mismatch. Always clears the cookie.
@@ -124,45 +151,31 @@ func appendEmailMismatchParams(baseURL, expectedEmail, actualEmail string) strin
 }
 
 // handlePostLoginRedirect performs the standard post-login redirect sequence:
-// 1. CLI redirect cookie
-// 2. Post-login redirect cookie (e.g., from /device page)
-// 3. Default: redirect to frontend
+//  1. CLI redirect cookie
+//  2. Post-login redirect cookie (set by the OAuth login start from ?redirect=),
+//     validated by resolvePostLoginRedirect
+//  3. Default: redirect to frontend
 //
 // Handles email mismatch parameters throughout. Returns after writing the redirect.
 func handlePostLoginRedirect(w http.ResponseWriter, r *http.Request, frontendURL, actualEmail, expectedEmail string, emailMismatch bool) {
-	log := logger.Ctx(r.Context())
-
-	// Check if this was a CLI login flow
 	if handleCLIRedirect(w, r, http.StatusTemporaryRedirect) {
 		return
 	}
 
-	// Check if there's a post-login redirect (e.g., from /device page or protected frontend route)
-	if postLoginRedirect, err := r.Cookie("post_login_redirect"); err == nil && postLoginRedirect.Value != "" {
+	redirectURL := frontendURL
+	if cookie, err := r.Cookie("post_login_redirect"); err == nil && cookie.Value != "" {
 		clearCookie(w, "post_login_redirect")
-		redirectURL := postLoginRedirect.Value
-		// SECURITY: Only allow relative paths to prevent open redirect attacks
-		if !strings.HasPrefix(redirectURL, "/") || strings.HasPrefix(redirectURL, "//") {
-			log.Warn("Blocked potential open redirect", "redirect_url", redirectURL)
-			redirectURL = "/"
+		if target, ok := resolvePostLoginRedirect(cookie.Value, frontendURL); ok {
+			redirectURL = target
+		} else {
+			logger.Ctx(r.Context()).Warn("Blocked potential open redirect", "redirect_url", cookie.Value)
 		}
-		// If it's a frontend path (not a backend path like /device), prepend frontend URL
-		if !strings.HasPrefix(redirectURL, "/auth") && !strings.HasPrefix(redirectURL, "/device") {
-			redirectURL = frontendURL + redirectURL
-		}
-		if emailMismatch {
-			redirectURL = appendEmailMismatchParams(redirectURL, expectedEmail, actualEmail)
-		}
-		http.Redirect(w, r, redirectURL, http.StatusTemporaryRedirect)
-		return
 	}
 
-	// Default: redirect to frontend
-	finalURL := frontendURL
 	if emailMismatch {
-		finalURL = appendEmailMismatchParams(finalURL, expectedEmail, actualEmail)
+		redirectURL = appendEmailMismatchParams(redirectURL, expectedEmail, actualEmail)
 	}
-	http.Redirect(w, r, finalURL, http.StatusTemporaryRedirect)
+	http.Redirect(w, r, redirectURL, http.StatusTemporaryRedirect)
 }
 
 // validateOAuthCallback performs the state+PKCE+code validation shared by every
@@ -454,24 +467,17 @@ func HandleLogout(database *db.DB, config *OAuthConfig) http.HandlerFunc {
 		}
 
 		// Check for redirect URL (e.g., for re-login with different account)
-		frontendURL := os.Getenv("FRONTEND_URL")
-		if redirectAfter := r.URL.Query().Get("redirect"); redirectAfter != "" {
-			// SECURITY: Only allow relative paths to prevent open redirect attacks
-			if strings.HasPrefix(redirectAfter, "/") && !strings.HasPrefix(redirectAfter, "//") {
-				// Prepend frontend URL for frontend paths, or use as-is for backend paths
-				if strings.HasPrefix(redirectAfter, "/auth") {
-					http.Redirect(w, r, redirectAfter, http.StatusTemporaryRedirect)
-					return
-				}
-				http.Redirect(w, r, frontendURL+redirectAfter, http.StatusTemporaryRedirect)
-				return
-			}
-			log.Warn("Blocked potential open redirect in logout", "redirect_url", redirectAfter)
-		}
-
-		// Redirect back to frontend
 		// Note: FRONTEND_URL is validated at startup in main.go
-		http.Redirect(w, r, frontendURL, http.StatusTemporaryRedirect)
+		frontendURL := os.Getenv("FRONTEND_URL")
+		redirectURL := frontendURL
+		if redirectAfter := r.URL.Query().Get("redirect"); redirectAfter != "" {
+			if target, ok := resolvePostLoginRedirect(redirectAfter, frontendURL); ok {
+				redirectURL = target
+			} else {
+				log.Warn("Blocked potential open redirect in logout", "redirect_url", redirectAfter)
+			}
+		}
+		http.Redirect(w, r, redirectURL, http.StatusTemporaryRedirect)
 	}
 }
 
@@ -561,9 +567,6 @@ func RequireSession(database *db.DB, config *OAuthConfig) func(http.Handler) htt
 			log := logger.Ctx(r.Context()).With("user_id", authResult.userID)
 			ctx := logger.WithLogger(r.Context(), log)
 
-			// Enrich OpenTelemetry span with user info
-			enrichSpanWithUser(ctx, authResult.userID, authResult.userEmail, false, true)
-
 			// Add user ID + read-only flag (CF-483) to context
 			ctx = context.WithValue(ctx, userIDContextKey, authResult.userID)
 			ctx = WithReadOnly(ctx, authResult.userReadOnly)
@@ -587,25 +590,21 @@ func RequireSessionOrAPIKey(database *db.DB, config *OAuthConfig) func(http.Hand
 			var userID int64
 			var userEmail string
 			var userReadOnly bool
-			var authAPIKey, authSession bool
 
 			// Try session cookie first
 			if sessionAuth := TrySessionAuth(r, database); sessionAuth != nil {
 				userID = sessionAuth.userID
 				userEmail = sessionAuth.userEmail
 				userReadOnly = sessionAuth.userReadOnly
-				authSession = true
 			} else if apiKeyAuth := TryAPIKeyAuth(r, database); apiKeyAuth != nil {
 				// Fall back to API key
 				userID = apiKeyAuth.userID
 				userEmail = apiKeyAuth.userEmail
 				userReadOnly = apiKeyAuth.userReadOnly
-				authAPIKey = true
 			} else if demoAuth := AutoImpersonateIfDemo(w, r, database, config.DemoIdentityEmail, config.CSRFSecretKey); demoAuth != nil {
 				userID = demoAuth.userID
 				userEmail = demoAuth.userEmail
 				userReadOnly = demoAuth.userReadOnly
-				authSession = true
 			} else {
 				http.Error(w, "Unauthorized", http.StatusUnauthorized)
 				return
@@ -623,9 +622,6 @@ func RequireSessionOrAPIKey(database *db.DB, config *OAuthConfig) func(http.Hand
 			// Enrich request-scoped logger with user_id
 			log := logger.Ctx(r.Context()).With("user_id", userID)
 			ctx := logger.WithLogger(r.Context(), log)
-
-			// Enrich OpenTelemetry span with user info
-			enrichSpanWithUser(ctx, userID, userEmail, authAPIKey, authSession)
 
 			// Add user ID + read-only flag (CF-483) to context
 			ctx = context.WithValue(ctx, userIDContextKey, userID)
@@ -654,24 +650,20 @@ func OptionalAuth(database *db.DB, config *OAuthConfig) func(http.Handler) http.
 			var userID int64
 			var userEmail string
 			var userReadOnly bool
-			var authAPIKey, authSession bool
 
 			// Try API key first, then session cookie
 			if apiKeyAuth := TryAPIKeyAuth(r, database); apiKeyAuth != nil {
 				userID = apiKeyAuth.userID
 				userEmail = apiKeyAuth.userEmail
 				userReadOnly = apiKeyAuth.userReadOnly
-				authAPIKey = true
 			} else if sessionAuth := TrySessionAuth(r, database); sessionAuth != nil {
 				userID = sessionAuth.userID
 				userEmail = sessionAuth.userEmail
 				userReadOnly = sessionAuth.userReadOnly
-				authSession = true
 			} else if demoAuth := AutoImpersonateIfDemo(w, r, database, config.DemoIdentityEmail, config.CSRFSecretKey); demoAuth != nil {
 				userID = demoAuth.userID
 				userEmail = demoAuth.userEmail
 				userReadOnly = demoAuth.userReadOnly
-				authSession = true
 			} else {
 				// No auth - when domain restrictions are in place, require authentication
 				// to prevent anonymous access to public shares on on-prem instances
@@ -692,7 +684,6 @@ func OptionalAuth(database *db.DB, config *OAuthConfig) func(http.Handler) http.
 			setLogUserID(w, userID)
 			log := logger.Ctx(r.Context()).With("user_id", userID)
 			ctx := logger.WithLogger(r.Context(), log)
-			enrichSpanWithUser(ctx, userID, userEmail, authAPIKey, authSession)
 			ctx = context.WithValue(ctx, userIDContextKey, userID)
 			ctx = WithReadOnly(ctx, userReadOnly)
 			next.ServeHTTP(w, r.WithContext(ctx))
@@ -729,52 +720,46 @@ func generateRandomString(length int) (string, error) {
 	return base64.URLEncoding.EncodeToString(bytes)[:length], nil
 }
 
-// HandleCLIAuthorize handles CLI API key generation flow
-func HandleCLIAuthorize(database *db.DB) http.HandlerFunc {
+// redirectCLIToLogin sends a CLI authorize request to the login selector and
+// sets the cli_redirect cookie so the post-login hop returns here confirmed.
+func redirectCLIToLogin(w http.ResponseWriter, r *http.Request) {
+	http.SetCookie(w, &http.Cookie{
+		Name:     "cli_redirect",
+		Value:    "/auth/cli/authorize?" + r.URL.RawQuery + "&confirmed=1",
+		Path:     "/",
+		MaxAge:   300, // 5 minutes
+		HttpOnly: true,
+		Secure:   cookieSecure(), // HTTPS-only (set INSECURE_DEV_MODE=true to disable for local dev)
+		SameSite: http.SameSiteLaxMode,
+	})
+	http.Redirect(w, r, "/login", http.StatusTemporaryRedirect)
+}
+
+// HandleCLIAuthorize handles CLI API key generation flow.
+//
+// The route has no credential middleware (it bootstraps a credential), so it
+// rechecks account eligibility itself before minting (dxys): TrySessionAuth
+// treats an inactive account as logged out, read-only identities are denied,
+// and the email domain must pass allowedDomains (empty = no restriction).
+func HandleCLIAuthorize(database *db.DB, allowedDomains []string) http.HandlerFunc {
 	authStore := &dbauth.Store{DB: database}
 	return func(w http.ResponseWriter, r *http.Request) {
 		log := logger.Ctx(r.Context())
 		ctx := r.Context()
+		frontendURL := os.Getenv("FRONTEND_URL")
 
 		// Check if user confirmed provider choice (came back from login selector)
 		confirmed := r.URL.Query().Get("confirmed") == "1"
 
-		// Get session cookie (user must be logged in via web)
-		cookie, err := r.Cookie(SessionCookieName)
-		if err != nil {
-			// No session - redirect to login selector, then back here
-			redirectURL := "/auth/cli/authorize?" + r.URL.RawQuery + "&confirmed=1"
-			http.SetCookie(w, &http.Cookie{
-				Name:     "cli_redirect",
-				Value:    redirectURL,
-				Path:     "/",
-				MaxAge:   300, // 5 minutes
-				HttpOnly: true,
-				Secure:   cookieSecure(), // HTTPS-only (set INSECURE_DEV_MODE=true to disable for local dev)
-				SameSite: http.SameSiteLaxMode,
-			})
-			http.Redirect(w, r, "/login", http.StatusTemporaryRedirect)
-			return
-		}
-
-		// Validate session
-		session, err := authStore.GetWebSession(ctx, cookie.Value, resolveSessionIdleTimeout(log))
-		if err != nil {
-			// Session is invalid or expired - clear the stale cookie and redirect to login
-			clearCookie(w, SessionCookieName)
-
-			// Redirect to login selector, then back here
-			redirectURL := "/auth/cli/authorize?" + r.URL.RawQuery + "&confirmed=1"
-			http.SetCookie(w, &http.Cookie{
-				Name:     "cli_redirect",
-				Value:    redirectURL,
-				Path:     "/",
-				MaxAge:   300, // 5 minutes
-				HttpOnly: true,
-				Secure:   cookieSecure(), // HTTPS-only (set INSECURE_DEV_MODE=true to disable for local dev)
-				SameSite: http.SameSiteLaxMode,
-			})
-			http.Redirect(w, r, "/login", http.StatusTemporaryRedirect)
+		// User must be logged in via web. A missing, expired, idle or inactive
+		// session all send the user to the login selector, then back here; a
+		// stale cookie is cleared first.
+		session := TrySessionAuth(r, database)
+		if session == nil {
+			if _, err := r.Cookie(SessionCookieName); err == nil {
+				clearCookie(w, SessionCookieName)
+			}
+			redirectCLIToLogin(w, r)
 			return
 		}
 
@@ -782,10 +767,9 @@ func HandleCLIAuthorize(database *db.DB) http.HandlerFunc {
 		// Even though the auth/cli/* endpoints are not auto-impersonated,
 		// a visitor who first browsed the SPA holds the shared demo
 		// cookie and would otherwise mint API keys here.
-		if session.ReadOnly {
-			log.Warn("CLI authorize blocked for read-only user", "user_id", session.UserID)
+		if session.userReadOnly {
+			log.Warn("CLI authorize blocked for read-only user", "user_id", session.userID)
 			clearCookie(w, SessionCookieName)
-			frontendURL := os.Getenv("FRONTEND_URL")
 			errorURL := fmt.Sprintf("%s/login?error=access_denied&error_description=%s",
 				frontendURL,
 				url.QueryEscape("This identity cannot create API keys. Log in with your own account."))
@@ -793,20 +777,17 @@ func HandleCLIAuthorize(database *db.DB) http.HandlerFunc {
 			return
 		}
 
+		// Email domain allow-list (no-op when allowedDomains is empty).
+		if !validation.IsAllowedEmailDomain(session.userEmail, allowedDomains) {
+			clearCookie(w, SessionCookieName)
+			redirectUserIneligible(w, r, frontendURL, "cli", session.userEmail, errEmailDomainNotPermitted)
+			return
+		}
+
 		// If user has session but hasn't confirmed provider choice yet, show selector
 		// This allows users to switch accounts/providers during CLI login
 		if !confirmed {
-			redirectURL := "/auth/cli/authorize?" + r.URL.RawQuery + "&confirmed=1"
-			http.SetCookie(w, &http.Cookie{
-				Name:     "cli_redirect",
-				Value:    redirectURL,
-				Path:     "/",
-				MaxAge:   300, // 5 minutes
-				HttpOnly: true,
-				Secure:   cookieSecure(),
-				SameSite: http.SameSiteLaxMode,
-			})
-			http.Redirect(w, r, "/login", http.StatusTemporaryRedirect)
+			redirectCLIToLogin(w, r)
 			return
 		}
 
@@ -838,13 +819,12 @@ func HandleCLIAuthorize(database *db.DB) http.HandlerFunc {
 
 		// Replace existing API key with same name, or create new one
 		// This prevents unbounded key growth when re-authenticating from the same machine
-		keyID, createdAt, err := authStore.ReplaceAPIKey(ctx, session.UserID, keyHash, keyName)
+		keyID, createdAt, err := authStore.ReplaceAPIKey(ctx, session.userID, keyHash, keyName)
 		if err != nil {
 			if err == db.ErrAPIKeyLimitExceeded {
 				// Redirect to callback with error that CLI can handle
-				frontendURL := os.Getenv("FRONTEND_URL")
 				redirectURL := fmt.Sprintf("%s?error=api_key_limit_exceeded", callback)
-				log.Warn("API key limit exceeded", "user_id", session.UserID)
+				log.Warn("API key limit exceeded", "user_id", session.userID)
 				// Also show a helpful page before redirecting
 				html := fmt.Sprintf(`<!DOCTYPE html>
 <html>
@@ -874,7 +854,7 @@ func HandleCLIAuthorize(database *db.DB) http.HandlerFunc {
 				w.Write([]byte(html))
 				return
 			}
-			log.Error("Failed to create API key in database", "error", err, "user_id", session.UserID)
+			log.Error("Failed to create API key in database", "error", err, "user_id", session.userID)
 			http.Error(w, "Failed to create API key", http.StatusInternalServerError)
 			return
 		}
@@ -882,7 +862,7 @@ func HandleCLIAuthorize(database *db.DB) http.HandlerFunc {
 		log.Info("API key created successfully",
 			"key_id", keyID,
 			"name", keyName,
-			"user_id", session.UserID,
+			"user_id", session.userID,
 			"created_at", createdAt)
 
 		// Redirect to callback with API key

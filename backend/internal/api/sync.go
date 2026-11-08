@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/ConfabulousDev/confab-web/internal/analytics"
+	"github.com/ConfabulousDev/confab-web/internal/codex"
 	"github.com/ConfabulousDev/confab-web/internal/db"
 	dbcodex "github.com/ConfabulousDev/confab-web/internal/db/codex"
 	dbcursor "github.com/ConfabulousDev/confab-web/internal/db/cursor"
@@ -487,9 +488,25 @@ func (s *Server) handleSyncChunk(w http.ResponseWriter, r *http.Request) {
 	if provider == models.ProviderOpencode {
 		extractTimestamp = extractOpenCodeTimestampFromLine
 	}
+	// Codex sessions never carry a summary (a Claude-only concept), so their
+	// list visibility rests entirely on first_user_message — a NULL column drops
+	// the session out of the session list AND out of Trends / cost-by-model
+	// (db.ListableSessionPredicate). Deriving it here rather than trusting the
+	// client keeps visibility independent of CLI parser correctness: a CLI that
+	// omits the field no longer strands the session (tgxn).
+	//
+	// First chunk only: in every rollout inspected the first user message lands
+	// by line 10, so chunk 1 always holds it. Sessions whose chunk 1 predates
+	// this fix are repaired by a separate backfill, not by re-deriving on every
+	// later chunk.
+	deriveFirstUserMessage := provider == models.ProviderCodex &&
+		req.FileType == "transcript" &&
+		req.FirstLine == 1 &&
+		(req.Metadata == nil || req.Metadata.FirstUserMessage == nil)
 
 	var content bytes.Buffer
 	var latestTimestamp *time.Time
+	var derivedFirstUserMessage string
 	var prLinks []*models.GitHubLink
 	prLinkSeen := make(map[string]struct{}) // dedup by "owner/repo/ref"
 	for _, line := range req.Lines {
@@ -502,6 +519,10 @@ func (s *Server) handleSyncChunk(w http.ResponseWriter, r *http.Request) {
 					latestTimestamp = ts
 				}
 			}
+		}
+
+		if deriveFirstUserMessage && derivedFirstUserMessage == "" {
+			derivedFirstUserMessage = codex.UserMessageFromLine(line)
 		}
 
 		if parseClaudeCode {
@@ -580,6 +601,22 @@ func (s *Server) handleSyncChunk(w http.ResponseWriter, r *http.Request) {
 		// UpdateSyncFileState lowers first_seen to it when it is earlier; clamp
 		// far-future values first (same sort-order-abuse guard as above).
 		createdAt = clampFutureTimestamp(req.Metadata.CreatedAt)
+	}
+
+	// Adopt the value derived from the chunk's own lines above. Derivation is
+	// gated on the client having supplied nothing, so a client-supplied message
+	// always wins verbatim, and an empty derivation leaves the column NULL
+	// rather than writing an empty-string title. This sits outside the metadata
+	// block because a chunk may carry no metadata at all — exactly the case
+	// being repaired.
+	//
+	// Unlike the client-supplied value (length-validated on the way in), a
+	// derived one has never been bounded, so clamp it rather than reject it: a
+	// pasted log as the first message must not fail the write and leave the
+	// session invisible, the very bug this fixes.
+	if derivedFirstUserMessage != "" {
+		derived := validation.TruncateToByteLimit(derivedFirstUserMessage, validation.MaxFirstUserMessageLength)
+		firstUserMessage = &derived
 	}
 
 	if err := sessionStore.UpdateSyncFileState(updateCtx, req.SessionID, req.FileName, req.FileType, lastLine, latestTimestamp, createdAt, summary, firstUserMessage, gitInfo); err != nil {
@@ -670,48 +707,6 @@ func (s *Server) handleSyncChunk(w http.ResponseWriter, r *http.Request) {
 	respondJSON(w, http.StatusOK, SyncChunkResponse{
 		LastSyncedLine: lastLine,
 	})
-}
-
-// filterLinesAfterOffset removes lines at or before the given offset.
-// The firstLineNum parameter indicates what transcript line the content starts at.
-// For example, if content is lines 4,5,6 of the transcript (firstLineNum=4) and
-// offset=3, all lines are kept (4,5,6 are all > 3). If offset=5, only line 6 is kept.
-func filterLinesAfterOffset(content []byte, offset int, firstLineNum int) []byte {
-	if offset <= 0 {
-		return content
-	}
-
-	// If all content is after offset, return everything
-	if offset < firstLineNum {
-		return content
-	}
-
-	lines := bytes.Split(content, []byte("\n"))
-
-	// Calculate how many lines to skip from the beginning
-	// Line at index i corresponds to transcript line (firstLineNum + i)
-	// We want lines where (firstLineNum + i) > offset
-	// So: i > offset - firstLineNum
-	// So: i >= offset - firstLineNum + 1
-	startIndex := offset - firstLineNum + 1
-
-	if startIndex >= len(lines) {
-		return nil
-	}
-
-	// Skip lines before startIndex
-	remaining := lines[startIndex:]
-
-	// Filter out empty trailing lines that result from split
-	for len(remaining) > 0 && len(remaining[len(remaining)-1]) == 0 {
-		remaining = remaining[:len(remaining)-1]
-	}
-
-	if len(remaining) == 0 {
-		return nil
-	}
-
-	return bytes.Join(remaining, []byte("\n"))
 }
 
 // handleSyncEvent records a session lifecycle event
@@ -960,10 +955,7 @@ func (s *Server) handleCanonicalSyncFileRead(w http.ResponseWriter, r *http.Requ
 	// Download chunks and parse their line ranges.
 	// Scale the timeout for large sessions: 10 parallel downloads at ~100ms each
 	// means ~100ms amortized per chunk. Use 500ms/chunk for headroom, capped at 5 min.
-	downloadTimeout := StorageTimeout + time.Duration(len(chunkKeys))*500*time.Millisecond
-	if downloadTimeout > 5*time.Minute {
-		downloadTimeout = 5 * time.Minute
-	}
+	downloadTimeout := min(StorageTimeout+time.Duration(len(chunkKeys))*500*time.Millisecond, 5*time.Minute)
 	// Extend the HTTP write deadline so the server doesn't kill the connection
 	// before the download+merge+write completes for large sessions.
 	rc := http.NewResponseController(w)
@@ -985,25 +977,12 @@ func (s *Server) handleCanonicalSyncFileRead(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	// Find the first line number among downloaded chunks (for correct filtering)
-	minFirstLine := chunks[0].FirstLine
-	for _, c := range chunks[1:] {
-		if c.FirstLine < minFirstLine {
-			minFirstLine = c.FirstLine
-		}
-	}
-
-	// Merge chunks, handling any overlaps from partial upload failures
-	merged, err := storage.MergeChunks(chunks)
-	if err != nil {
+	// Reject an oversized merge while a 500 can still be sent: after the
+	// headers below, the body is streamed and only write errors remain.
+	if err := storage.ValidateMerge(chunks); err != nil {
 		log.Error("Failed to merge chunks", "error", err, "session_id", sessionID)
 		respondError(w, http.StatusInternalServerError, "Failed to process session data")
 		return
-	}
-
-	// If line_offset is specified, filter output to only lines after offset
-	if lineOffset > 0 {
-		merged = filterLinesAfterOffset(merged, lineOffset, minFirstLine)
 	}
 
 	log.Info("Canonical sync file read",
@@ -1014,19 +993,20 @@ func (s *Server) handleCanonicalSyncFileRead(w http.ResponseWriter, r *http.Requ
 		"access_type", result.AccessInfo.AccessType,
 		"viewer_user_id", result.ViewerUserID)
 
-	// Write response
+	// Stream the merged lines after lineOffset (overlaps resolved, last write
+	// wins) instead of materializing the merged transcript (x4ry).
 	// Use text/plain for JSONL files (multiple JSON objects, one per line)
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
-	if merged != nil {
-		w.Write(merged)
+	if _, err := storage.WriteMergedLines(newFlushWriter(w), chunks, lineOffset); err != nil {
+		log.Warn("Failed to write sync file response", "error", err, "session_id", sessionID, "file_name", fileName)
 	}
 }
 
 // extractTextFromMessage extracts the first text content from a message entry
 // Handles both string content and array content (multimodal messages)
-func extractTextFromMessage(entry map[string]interface{}) string {
-	message, ok := entry["message"].(map[string]interface{})
+func extractTextFromMessage(entry map[string]any) string {
+	message, ok := entry["message"].(map[string]any)
 	if !ok {
 		return ""
 	}
@@ -1042,9 +1022,9 @@ func extractTextFromMessage(entry map[string]interface{}) string {
 	}
 
 	// Case 2: content is an array of content blocks (multimodal)
-	if arr, ok := content.([]interface{}); ok {
+	if arr, ok := content.([]any); ok {
 		for _, block := range arr {
-			if blockMap, ok := block.(map[string]interface{}); ok {
+			if blockMap, ok := block.(map[string]any); ok {
 				if blockType, _ := blockMap["type"].(string); blockType == "text" {
 					if text, ok := blockMap["text"].(string); ok && text != "" {
 						return text

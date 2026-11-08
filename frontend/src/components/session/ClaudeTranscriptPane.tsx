@@ -10,7 +10,7 @@ import type { TranscriptLine } from '@/types';
 import ClaudeMessageTimeline from '@/components/transcript/claude/ClaudeMessageTimeline';
 import TranscriptPaneStatus from './TranscriptPaneStatus';
 
-export interface ClaudeTranscriptPaneProps {
+interface ClaudeTranscriptPaneProps {
   loading: boolean;
   error: string | null;
   filteredMessages: TranscriptLine[];
@@ -18,6 +18,12 @@ export interface ClaudeTranscriptPaneProps {
   sessionId: string;
   targetMessageUuid?: string;
   isCostMode: boolean;
+  /** et0r: the subagent thread shown; null/undefined = Main. */
+  activeThreadId?: string | null;
+  /** et0r: open a subagent thread from a subagent card. */
+  onOpenThread?: (threadId: string) => void;
+  /** et0r D7: the thread's file isn't uploaded yet. */
+  notSynced?: boolean;
 }
 
 export default function ClaudeTranscriptPane({
@@ -28,9 +34,12 @@ export default function ClaudeTranscriptPane({
   sessionId,
   targetMessageUuid,
   isCostMode,
+  activeThreadId,
+  onOpenThread,
+  notSynced,
 }: ClaudeTranscriptPaneProps) {
-  if (loading || error) {
-    return <TranscriptPaneStatus loading={loading} error={error} />;
+  if (loading || error || notSynced) {
+    return <TranscriptPaneStatus loading={loading} error={error} notSynced={notSynced} />;
   }
 
   return (
@@ -40,6 +49,8 @@ export default function ClaudeTranscriptPane({
       targetMessageUuid={targetMessageUuid}
       sessionId={sessionId}
       isCostMode={isCostMode}
+      activeThreadId={activeThreadId}
+      onOpenThread={onOpenThread}
     />
   );
 }

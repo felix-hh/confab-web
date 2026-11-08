@@ -23,10 +23,38 @@ const (
 	// ProviderPassword is the provider name for password-based auth
 	ProviderPassword = "password"
 
-	// BcryptCost is the cost factor for bcrypt hashing
-	// 12 is a good balance of security and performance (~250ms on modern hardware)
-	BcryptCost = 12
+	// BcryptCost is the cost factor for bcrypt hashing. Defined in dbauth,
+	// which needs it for its unknown-user dummy hash and cannot import auth.
+	BcryptCost = dbauth.BcryptCost
+
+	// MinPasswordBytes and MaxPasswordBytes bound password length in bytes,
+	// not characters. 72 is bcrypt's input limit: GenerateFromPassword rejects
+	// longer input, and CompareHashAndPassword silently ignores bytes past 72.
+	MinPasswordBytes = 8
+	MaxPasswordBytes = 72
 )
+
+var (
+	// ErrPasswordTooShort is returned by ValidatePasswordLength for a password
+	// shorter than MinPasswordBytes.
+	ErrPasswordTooShort = errors.New("password too short")
+	// ErrPasswordTooLong is returned by ValidatePasswordLength for a password
+	// longer than MaxPasswordBytes.
+	ErrPasswordTooLong = errors.New("password too long")
+)
+
+// ValidatePasswordLength enforces the password length policy for paths that
+// set a password: MinPasswordBytes to MaxPasswordBytes bytes. Over-long
+// passwords are rejected, never truncated.
+func ValidatePasswordLength(password string) error {
+	switch {
+	case len(password) < MinPasswordBytes:
+		return ErrPasswordTooShort
+	case len(password) > MaxPasswordBytes:
+		return ErrPasswordTooLong
+	}
+	return nil
+}
 
 // HashPassword creates a bcrypt hash of the password
 func HashPassword(password string) (string, error) {
@@ -69,7 +97,9 @@ func HandlePasswordLogin(database *db.DB, config *OAuthConfig) http.HandlerFunc 
 			redirectWithError(w, r, "Password is required")
 			return
 		}
-		if len(password) > 1024 {
+		// Checked before AuthenticatePassword, so it never counts as a failed
+		// attempt. No stored hash can belong to a longer password.
+		if len(password) > MaxPasswordBytes {
 			redirectWithError(w, r, "Password is too long")
 			return
 		}
@@ -134,30 +164,25 @@ func HandlePasswordLogin(database *db.DB, config *OAuthConfig) http.HandlerFunc 
 			SameSite: http.SameSiteLaxMode,
 		})
 
-		// Handle post-login redirect (same as OAuth)
-		frontendURL := os.Getenv("FRONTEND_URL")
-
-		// Check for post-login redirect cookie
-		if postLoginRedirect, err := r.Cookie("post_login_redirect"); err == nil && postLoginRedirect.Value != "" {
-			clearCookie(w, "post_login_redirect")
-			redirectURL := postLoginRedirect.Value
-			// SECURITY: Only allow relative paths
-			if strings.HasPrefix(redirectURL, "/") && !strings.HasPrefix(redirectURL, "//") {
-				if !strings.HasPrefix(redirectURL, "/auth") && !strings.HasPrefix(redirectURL, "/device") {
-					redirectURL = frontendURL + redirectURL
-				}
-				http.Redirect(w, r, redirectURL, http.StatusSeeOther)
-				return
-			}
-		}
-
-		// CLI login flow
+		// Post-login redirect, same precedence as OAuth: CLI cookie, then the
+		// explicit target, then the frontend. The explicit target is the
+		// redirect form field LoginPage posts. The post_login_redirect cookie
+		// belongs to OAuth login starts, so a stale one left by an abandoned
+		// OAuth click is cleared and never honored here.
+		clearCookie(w, "post_login_redirect")
 		if handleCLIRedirect(w, r, http.StatusSeeOther) {
 			return
 		}
-
-		// Default: redirect to frontend
-		http.Redirect(w, r, frontendURL, http.StatusSeeOther)
+		frontendURL := os.Getenv("FRONTEND_URL")
+		redirectURL := frontendURL
+		if raw := r.FormValue("redirect"); raw != "" {
+			if target, ok := resolvePostLoginRedirect(raw, frontendURL); ok {
+				redirectURL = target
+			} else {
+				log.Warn("Blocked potential open redirect", "redirect_url", raw)
+			}
+		}
+		http.Redirect(w, r, redirectURL, http.StatusSeeOther)
 	}
 }
 
@@ -215,9 +240,11 @@ func BootstrapAdmin(ctx context.Context, database *db.DB, allowedDomains []strin
 		return fmt.Errorf("ADMIN_BOOTSTRAP_EMAIL domain %q is not in ALLOWED_EMAIL_DOMAINS", domain)
 	}
 
-	// Validate password (minimum 8 characters)
-	if len(password) < 8 {
-		return fmt.Errorf("ADMIN_BOOTSTRAP_PASSWORD must be at least 8 characters")
+	switch err := ValidatePasswordLength(password); {
+	case errors.Is(err, ErrPasswordTooShort):
+		return fmt.Errorf("ADMIN_BOOTSTRAP_PASSWORD must be at least %d characters", MinPasswordBytes)
+	case errors.Is(err, ErrPasswordTooLong):
+		return fmt.Errorf("ADMIN_BOOTSTRAP_PASSWORD must be at most %d bytes", MaxPasswordBytes)
 	}
 
 	// Hash password

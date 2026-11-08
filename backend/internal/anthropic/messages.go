@@ -3,26 +3,31 @@ package anthropic
 import (
 	"encoding/json"
 	"fmt"
+	"strings"
 )
 
 // MessagesRequest represents a request to the Messages API.
 type MessagesRequest struct {
-	Model        string        `json:"model"`
-	MaxTokens    int           `json:"max_tokens"`
-	Temperature  *float64      `json:"temperature,omitempty"`
-	System       string        `json:"system,omitempty"`
-	Messages     []Message     `json:"messages"`
-	OutputConfig *OutputConfig `json:"output_config,omitempty"`
+	Model        string          `json:"model"`
+	MaxTokens    int             `json:"max_tokens"`
+	Temperature  *float64        `json:"temperature,omitempty"`
+	System       string          `json:"system,omitempty"`
+	Messages     []Message       `json:"messages"`
+	Thinking     *ThinkingConfig `json:"thinking,omitempty"`
+	OutputConfig *OutputConfig   `json:"output_config,omitempty"`
 }
 
-// OutputConfig constrains the response format (structured outputs).
+// ThinkingConfig controls extended thinking (e.g. Type "disabled").
+type ThinkingConfig struct {
+	Type string `json:"type"`
+}
+
+// OutputConfig shapes the model's output (structured outputs).
 type OutputConfig struct {
 	Format *OutputFormat `json:"format,omitempty"`
 }
 
-// OutputFormat specifies a JSON schema the response must conform to.
-// Type is always "json_schema". Schema must be a valid JSON Schema object
-// with additionalProperties: false on every object.
+// OutputFormat constrains the response, e.g. Type "json_schema" with a JSON Schema.
 type OutputFormat struct {
 	Type   string          `json:"type"`
 	Schema json.RawMessage `json:"schema"`
@@ -62,13 +67,13 @@ type Usage struct {
 
 // GetTextContent extracts all text content from the response.
 func (r *MessagesResponse) GetTextContent() string {
-	var text string
+	var text strings.Builder
 	for _, block := range r.Content {
 		if block.Type == "text" {
-			text += block.Text
+			text.WriteString(block.Text)
 		}
 	}
-	return text
+	return text.String()
 }
 
 // APIError represents an error response from the Anthropic API.

@@ -9,10 +9,6 @@ import (
 	"fmt"
 	"strings"
 	"sync"
-
-	"go.opentelemetry.io/otel/attribute"
-	"go.opentelemetry.io/otel/codes"
-	"go.opentelemetry.io/otel/trace"
 )
 
 // =============================================================================
@@ -57,7 +53,7 @@ func (c jsonCol[V]) Value() (driver.Value, error) { return json.Marshal(*c.ptr) 
 // ("[]") rather than null, preserving the workflows card's stored shape.
 type jsonSliceCol[E any] struct{ ptr *[]E }
 
-func (c jsonSliceCol[E]) Scan(src any) error { return jsonCol[[]E]{c.ptr}.Scan(src) }
+func (c jsonSliceCol[E]) Scan(src any) error { return jsonCol[[]E](c).Scan(src) }
 
 func (c jsonSliceCol[E]) Value() (driver.Value, error) {
 	s := *c.ptr
@@ -408,19 +404,13 @@ var cardOps = []cardOp{
 // Returns a Cards struct with nil fields for cards that don't exist.
 // All card queries run in parallel to minimize latency.
 func (s *Store) GetCards(ctx context.Context, sessionID string) (*Cards, error) {
-	ctx, span := tracer.Start(ctx, "analytics.get_cards",
-		trace.WithAttributes(attribute.String("session.id", sessionID)))
-	defer span.End()
-
 	cards := &Cards{}
 	var mu sync.Mutex
 	var wg sync.WaitGroup
 	errs := make(chan error, len(cardOps))
 
 	for _, op := range cardOps {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			assign, err := op.fetch(ctx, s, sessionID)
 			if err != nil {
 				errs <- fmt.Errorf("%s: %w", op.name, err)
@@ -429,41 +419,21 @@ func (s *Store) GetCards(ctx context.Context, sessionID string) (*Cards, error) 
 			mu.Lock()
 			assign(cards)
 			mu.Unlock()
-		}()
+		})
 	}
 
 	wg.Wait()
 	close(errs)
 
-	var allErrs []error
-	for err := range errs {
-		allErrs = append(allErrs, err)
+	if err := joinErrors(errs); err != nil {
+		return nil, err
 	}
-	if len(allErrs) > 0 {
-		combined := errors.Join(allErrs...)
-		span.RecordError(combined)
-		span.SetStatus(codes.Error, combined.Error())
-		return nil, combined
-	}
-
 	return cards, nil
 }
 
 // UpsertCards inserts or updates all set cards for a session.
 // All card upserts run in parallel to minimize latency.
 func (s *Store) UpsertCards(ctx context.Context, cards *Cards) error {
-	// Get session ID from the first available card for tracing.
-	var sessionID string
-	if cards.TokensV2 != nil {
-		sessionID = cards.TokensV2.SessionID
-	} else if cards.Session != nil {
-		sessionID = cards.Session.SessionID
-	}
-
-	ctx, span := tracer.Start(ctx, "analytics.upsert_cards",
-		trace.WithAttributes(attribute.String("session.id", sessionID)))
-	defer span.End()
-
 	var wg sync.WaitGroup
 	errs := make(chan error, len(cardOps))
 
@@ -471,28 +441,25 @@ func (s *Store) UpsertCards(ctx context.Context, cards *Cards) error {
 		if !op.present(cards) {
 			continue
 		}
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			if err := op.upsert(ctx, s, cards); err != nil {
 				errs <- fmt.Errorf("%s: %w", op.name, err)
 			}
-		}()
+		})
 	}
 
 	wg.Wait()
 	close(errs)
 
+	return joinErrors(errs)
+}
+
+// joinErrors drains a closed error channel and joins its contents,
+// returning nil if the channel was empty.
+func joinErrors(errs <-chan error) error {
 	var allErrs []error
 	for err := range errs {
 		allErrs = append(allErrs, err)
 	}
-	if len(allErrs) > 0 {
-		combined := errors.Join(allErrs...)
-		span.RecordError(combined)
-		span.SetStatus(codes.Error, combined.Error())
-		return combined
-	}
-
-	return nil
+	return errors.Join(allErrs...)
 }

@@ -44,7 +44,7 @@ func seedAdminCardInvalidation(t *testing.T, env *testutil.TestEnvironment, sess
 func bypassTestConfig(quota int) analytics.PrecomputeConfig {
 	return analytics.PrecomputeConfig{
 		SmartRecapEnabled:      true,
-		AnthropicAPIKey:        "test-key",
+		SmartRecapAPIKey:       "test-key",
 		SmartRecapModel:        "test-model",
 		SmartRecapQuota:        quota,
 		LockTimeoutSeconds:     60,
@@ -144,6 +144,34 @@ func TestBypass_OverQuota_InvalidationDoesNotIncludeSmartRecap_NotFound(t *testi
 	}
 	if len(sessions) != 0 {
 		t.Errorf("expected 0 sessions (invalidation does not cover smart_recap), got %d", len(sessions))
+	}
+}
+
+// TestBypass_OverQuota_SessionTitleOnlyInvalidation_NotFound pins that a
+// session_title invalidation (nbrd) never grants a smart-recap quota bypass.
+func TestBypass_OverQuota_SessionTitleOnlyInvalidation_NotFound(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
+	env := testutil.SetupTestEnvironment(t)
+	env.CleanDB(t)
+
+	admin := testutil.CreateTestUser(t, env, "admin@test.com", "Admin")
+	user := testutil.CreateTestUser(t, env, "overquota4@test.com", "Over Quota")
+	sessionID := seedSessionReadyForSmartRecap(t, env, user.ID, 1000)
+
+	seedFullQuotaForUser(t, env, user.ID, 5)
+	seedAdminCardInvalidation(t, env, sessionID, admin.ID, []string{analytics.SessionTitleInvalidationTarget}, time.Now().UTC())
+
+	store := analytics.NewStore(env.DB.Conn())
+	precomputer := analytics.NewPrecomputer(env.DB.Conn(), env.Storage, store, bypassTestConfig(5))
+
+	sessions, err := precomputer.FindStaleSmartRecapSessions(context.Background(), 100)
+	if err != nil {
+		t.Fatalf("FindStaleSmartRecapSessions: %v", err)
+	}
+	if len(sessions) != 0 {
+		t.Errorf("expected 0 sessions (session_title invalidation is not a recap bypass), got %d", len(sessions))
 	}
 }
 

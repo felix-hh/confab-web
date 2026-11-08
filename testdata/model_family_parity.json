@@ -4,9 +4,14 @@
     { "provider": "claude-code", "id": "claude-opus-4-5-20251101",  "backend": "opus-4-5",   "frontend": "opus-4-5" },
     { "provider": "claude-code", "id": "claude-sonnet-4-5-20250929", "backend": "sonnet-4-5", "frontend": "sonnet-4-5" },
     { "provider": "claude-code", "id": "claude-haiku-4-5-20251001",  "backend": "haiku-4-5",  "frontend": "haiku-4-5" },
+    { "provider": "claude-code", "id": "claude-haiku-5-5",            "backend": "haiku-5-5",  "frontend": "haiku-5-5" },
     { "provider": "claude-code", "id": "claude-sonnet-4-20250514",   "backend": "sonnet-4",   "frontend": "sonnet-4" },
     { "provider": "claude-code", "id": "claude-sonnet-5-20260701",  "backend": "sonnet-5",   "frontend": "sonnet-5" },
-    { "provider": "claude-code", "id": "claude-fable-5",             "backend": "fable-5",    "frontend": "fable-5" },
+    { "provider": "claude-code", "id": "claude-sonnet-5-5",           "backend": "sonnet-5-5", "frontend": "sonnet-5-5" },
+    { "provider": "claude-code", "id": "claude-fable-5",            "backend": "fable-5",    "frontend": "fable-5" },
+    { "provider": "claude-code", "id": "claude-fable-5-1",           "backend": "fable-5-1",  "frontend": "fable-5-1" },
+    { "provider": "claude-code", "id": "claude-mythos-5-1",          "backend": "mythos-5-1", "frontend": "mythos-5-1" },
+    { "provider": "claude-code", "id": "claude-opus-5-5",            "backend": "opus-5-5",   "frontend": "opus-5-5" },
     { "provider": "claude-code", "id": "claude-opus-4-9-20261201",   "backend": "opus-4-9",   "frontend": "opus-4-9" },
     { "provider": "claude-code", "id": "claude-opus-4-10",           "backend": "opus-4",     "frontend": "opus-4" },
     {
@@ -14,6 +19,11 @@
       "note": "MALFORMED id (non-digit major '4a'). Documented, intentional divergence: backend's single-digit-major check fails and returns the raw name 'opus-4a-5' ($0 — no pricing match); the frontend regex stops at 'a' and returns 'opus-4' (which could bind to real opus-4 pricing). Low severity — such ids don't occur in practice. This row pins the KNOWN divergence so any further drift fails CI; do not 'fix' it by editing the fixture (5x6e F7 / nrxr)."
     },
     { "provider": "codex", "id": "gpt-5-2026-05-01", "backend": "gpt-5",   "frontend": "gpt-5" },
-    { "provider": "codex", "id": "gpt-5.4",          "backend": "gpt-5.4", "frontend": "gpt-5.4" }
+    { "provider": "codex", "id": "gpt-5.4",          "backend": "gpt-5.4", "frontend": "gpt-5.4" },
+    { "provider": "codex", "id": "gpt-6.1-sol",      "backend": "gpt-6.1-sol", "frontend": "gpt-6.1-sol" },
+    { "provider": "codex", "id": "gpt-6.1-sol-2026-09-29", "backend": "gpt-6.1-sol", "frontend": "gpt-6.1-sol" },
+    { "provider": "codex", "id": "gpt-6.1-terra",    "backend": "gpt-6.1-terra", "frontend": "gpt-6.1-terra" },
+    { "provider": "codex", "id": "gpt-6-sol",        "backend": "gpt-6-sol",  "frontend": "gpt-6-sol" },
+    { "provider": "codex", "id": "gpt-6-luna",       "backend": "gpt-6-luna", "frontend": "gpt-6-luna" }
   ]
 }

@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"unicode/utf8"
 )
 
 func TestValidateExternalID(t *testing.T) {
@@ -324,6 +325,57 @@ func TestValidateCodexRolloutMetadata(t *testing.T) {
 	}
 }
 
+// TestValidateCodexRolloutMetadataSelfParentComparesParsedUUIDs locks wmet:
+// the self-parent check compares parsed UUID values, not raw strings, so every
+// spelling uuid.Parse accepts for the same UUID (case, raw hex, URN, braces) is
+// rejected as a self-link. codex_rollouts stores both columns as Postgres UUID,
+// so these spellings would otherwise persist as a genuine self-edge.
+func TestValidateCodexRolloutMetadataSelfParentComparesParsedUUIDs(t *testing.T) {
+	const lower = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+	const selfLinkErr = "parent_thread_uuid must not equal thread_uuid"
+
+	tests := []struct {
+		name       string
+		threadUUID string
+		parentUUID string
+		wantErr    string // empty means accepted
+	}{
+		{"identical spelling is rejected", lower, lower, selfLinkErr},
+		{"upper-case parent is rejected", lower, strings.ToUpper(lower), selfLinkErr},
+		{"upper-case thread is rejected", strings.ToUpper(lower), lower, selfLinkErr},
+		{"mixed-case parent is rejected", lower, "AaAaAaAa-aAaA-4AaA-8aAa-aAaAaAaAaAaA", selfLinkErr},
+		{"raw 32-hex parent is rejected", lower, strings.ReplaceAll(lower, "-", ""), selfLinkErr},
+		{"urn:uuid parent is rejected", lower, "urn:uuid:" + lower, selfLinkErr},
+		{"braced parent is rejected", lower, "{" + lower + "}", selfLinkErr},
+		{"braced upper-case thread vs urn parent is rejected", "{" + strings.ToUpper(lower) + "}", "urn:uuid:" + lower, selfLinkErr},
+		{"distinct UUIDs are accepted", lower, "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", ""},
+		{"distinct UUIDs differing in one nibble are accepted", lower, "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaab", ""},
+		{"distinct UUIDs in different spellings are accepted", lower, "URN:UUID:BBBBBBBB-BBBB-4BBB-8BBB-BBBBBBBBBBBB", ""},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			parent := tt.parentUUID
+			err := ValidateCodexRolloutMetadata(
+				tt.threadUUID, &parent,
+				"/path", "", "", "", "", "", "", "",
+			)
+			if tt.wantErr == "" {
+				if err != nil {
+					t.Fatalf("distinct thread/parent UUIDs must be accepted, got error: %v", err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("thread_uuid %q and parent_thread_uuid %q are the same UUID and must be rejected as a self-link", tt.threadUUID, tt.parentUUID)
+			}
+			if err.Error() != tt.wantErr {
+				t.Errorf("self-link error = %q, want %q", err.Error(), tt.wantErr)
+			}
+		})
+	}
+}
+
 // TestValidateGitInfo covers CF-494's wire-layer validation of the new
 // `remotes` and `tracking_remote` fields. Old-shape payloads pass through
 // untouched; the validator only enforces caps and per-entry shape when the
@@ -334,7 +386,7 @@ func TestValidateGitInfo(t *testing.T) {
 	manyRemotes := func(n int) string {
 		var sb strings.Builder
 		sb.WriteString(`{"remotes":[`)
-		for i := 0; i < n; i++ {
+		for i := range n {
 			if i > 0 {
 				sb.WriteString(",")
 			}
@@ -378,6 +430,40 @@ func TestValidateGitInfo(t *testing.T) {
 			}
 			if err := ValidateGitInfo(in); (err != nil) != tt.wantErr {
 				t.Errorf("ValidateGitInfo() error = %v, wantErr %v", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestTruncateToByteLimit(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+		limit int
+		want  string
+	}{
+		{"under the limit is unchanged", "hello", 10, "hello"},
+		{"exactly at the limit is unchanged", "hello", 5, "hello"},
+		{"ascii over the limit is clipped", "hello world", 5, "hello"},
+		{"empty string", "", 5, ""},
+		{"zero limit returns input unchanged", "hello", 0, "hello"},
+		{"negative limit returns input unchanged", "hello", -1, "hello"},
+		// "é" is 2 bytes: a byte-exact cut at 3 would split the second rune.
+		{"multibyte cut backs off to a rune boundary", "ééé", 3, "é"},
+		{"multibyte cut on a boundary keeps the rune", "ééé", 4, "éé"},
+		// A 4-byte rune must not be sliced through either.
+		{"four-byte rune is dropped rather than split", "a😀", 3, "a"},
+		{"four-byte rune kept when it fits", "a😀", 5, "a😀"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := TruncateToByteLimit(tt.input, tt.limit)
+			if got != tt.want {
+				t.Errorf("TruncateToByteLimit(%q, %d) = %q, want %q", tt.input, tt.limit, got, tt.want)
+			}
+			if !utf8.ValidString(got) {
+				t.Errorf("TruncateToByteLimit(%q, %d) = %q, which is not valid UTF-8", tt.input, tt.limit, got)
 			}
 		})
 	}

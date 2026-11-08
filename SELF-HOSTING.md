@@ -302,13 +302,24 @@ The install script fetches pre-built binaries from [GitHub Releases](https://git
 
 ## Smart Recaps (Optional)
 
-AI-powered session summaries using the Anthropic API. Requires an [Anthropic API key](https://console.anthropic.com/). Add to `.env`:
+AI-powered session summaries using the Anthropic or OpenAI API. Requires an [Anthropic API key](https://console.anthropic.com/) or an [OpenAI API key](https://platform.openai.com/api-keys). Add to `.env`:
 
 ```bash
 SMART_RECAP_ENABLED=true
 ANTHROPIC_API_KEY=sk-ant-xxxxxxxxxxxx
 SMART_RECAP_MODEL=claude-haiku-4-5-20251001
 SMART_RECAP_QUOTA_LIMIT=500  # Monthly per-user generation limit
+```
+
+Anthropic smart recaps support Claude Haiku 4.5, Sonnet 5, Opus 4.8, and Opus 5. Fable and Mythos models (thinking always on) are not supported.
+
+To use OpenAI instead:
+
+```bash
+SMART_RECAP_ENABLED=true
+SMART_RECAP_LLM_PROVIDER=openai
+OPENAI_API_KEY=sk-xxxxxxxxxxxx
+SMART_RECAP_MODEL=gpt-6-luna
 ```
 
 The bundled `worker` service precomputes recaps in the background. See [CONFIGURATION.md](CONFIGURATION.md) for advanced worker tuning options.

@@ -9,12 +9,12 @@ import (
 	"strings"
 	"time"
 
-	"github.com/go-chi/chi/v5"
 	"github.com/ConfabulousDev/confab-web/internal/analytics"
 	"github.com/ConfabulousDev/confab-web/internal/db"
 	dbsession "github.com/ConfabulousDev/confab-web/internal/db/session"
 	"github.com/ConfabulousDev/confab-web/internal/logger"
 	"github.com/ConfabulousDev/confab-web/internal/storage"
+	"github.com/go-chi/chi/v5"
 )
 
 // CondensedTranscriptResponse is the JSON response for the condensed transcript endpoint.
@@ -25,17 +25,17 @@ type CondensedTranscriptResponse struct {
 
 // CondensedTranscriptMetadata contains session metadata alongside the condensed transcript.
 type CondensedTranscriptMetadata struct {
-	SessionID        string                 `json:"session_id"`
-	ExternalID       string                 `json:"external_id"`
-	Title            string                 `json:"title"`
-	Repo             *string                `json:"repo,omitempty"`
-	Branch           *string                `json:"branch,omitempty"`
-	FirstSeen        time.Time              `json:"first_seen"`
-	LastSyncAt       *time.Time             `json:"last_sync_at,omitempty"`
-	TotalLines       int64                  `json:"total_lines"`
-	EstimatedCostUSD *float64               `json:"estimated_cost_usd,omitempty"`
-	SmartRecap       *SmartRecapExport      `json:"smart_recap,omitempty"`
-	Analytics        map[string]interface{} `json:"analytics,omitempty"`
+	SessionID        string            `json:"session_id"`
+	ExternalID       string            `json:"external_id"`
+	Title            string            `json:"title"`
+	Repo             *string           `json:"repo,omitempty"`
+	Branch           *string           `json:"branch,omitempty"`
+	FirstSeen        time.Time         `json:"first_seen"`
+	LastSyncAt       *time.Time        `json:"last_sync_at,omitempty"`
+	TotalLines       int64             `json:"total_lines"`
+	EstimatedCostUSD *float64          `json:"estimated_cost_usd,omitempty"`
+	SmartRecap       *SmartRecapExport `json:"smart_recap,omitempty"`
+	Analytics        map[string]any    `json:"analytics,omitempty"`
 }
 
 // SmartRecapExport is a simplified smart recap for external consumption.
@@ -194,7 +194,7 @@ func buildCondensedMetadata(session *db.SessionDetail, totalLines int64) Condens
 	}
 
 	// Extract repo and branch from git_info
-	if gitInfo, ok := session.GitInfo.(map[string]interface{}); ok {
+	if gitInfo, ok := session.GitInfo.(map[string]any); ok {
 		if repoURL, ok := gitInfo["repo_url"].(string); ok && repoURL != "" {
 			repo := extractRepoName(repoURL)
 			meta.Repo = &repo
@@ -330,11 +330,20 @@ func (s *Server) serveSessionFileDownload(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	// Download and merge all chunks for this file
+	// Download and validate all chunks before writing headers, so storage and
+	// merge-limit errors are still reported as a 500. The merge itself is
+	// streamed into the response below.
 	storageCtx, storageCancel := context.WithTimeout(r.Context(), StorageTimeout)
 	defer storageCancel()
 
-	content, err := s.storage.DownloadAndMergeChunks(storageCtx, sessionUserID, sessionProvider, externalID, fileName)
+	chunkKeys, err := s.storage.ListChunks(storageCtx, sessionUserID, sessionProvider, externalID, fileName)
+	var chunks []storage.ChunkInfo
+	if err == nil {
+		chunks, err = s.storage.DownloadChunks(storageCtx, chunkKeys)
+	}
+	if err == nil {
+		err = storage.ValidateMerge(chunks)
+	}
 	if err != nil {
 		log.Error("Failed to download file", "error", err, "session_id", sessionID, "file_name", fileName)
 		respondError(w, http.StatusInternalServerError, "Failed to download file")
@@ -348,7 +357,9 @@ func (s *Server) serveSessionFileDownload(w http.ResponseWriter, r *http.Request
 	// browser when fetched directly.
 	w.Header().Set("Content-Disposition", `attachment; filename="`+sanitizeContentDispositionFilename(fileName)+`"`)
 	w.WriteHeader(http.StatusOK)
-	w.Write(content)
+	if _, err := storage.WriteMergedLines(newFlushWriter(w), chunks, 0); err != nil {
+		log.Warn("Failed to write file download response", "error", err, "session_id", sessionID, "file_name", fileName)
+	}
 }
 
 // sanitizeContentDispositionFilename strips characters that could break the

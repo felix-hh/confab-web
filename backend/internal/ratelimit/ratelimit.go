@@ -128,7 +128,7 @@ func (l *InMemoryRateLimiter) evictOldest() {
 		when time.Time
 	}
 	var entries []entry
-	l.lastAccess.Range(func(key, value interface{}) bool {
+	l.lastAccess.Range(func(key, value any) bool {
 		entries = append(entries, entry{key.(string), value.(time.Time)})
 		return true
 	})
@@ -136,13 +136,7 @@ func (l *InMemoryRateLimiter) evictOldest() {
 		return
 	}
 
-	batch := l.maxBuckets / 100
-	if batch < 1 {
-		batch = 1
-	}
-	if batch > len(entries) {
-		batch = len(entries)
-	}
+	batch := min(max(l.maxBuckets/100, 1), len(entries))
 
 	sort.Slice(entries, func(i, j int) bool {
 		return entries[i].when.Before(entries[j].when)
@@ -182,7 +176,7 @@ func (l *InMemoryRateLimiter) cleanupOldLimiters() {
 	cutoff := time.Now().UTC().Add(-l.maxAge)
 	var keysToDelete []string
 
-	l.lastAccess.Range(func(key, value interface{}) bool {
+	l.lastAccess.Range(func(key, value any) bool {
 		if value.(time.Time).Before(cutoff) {
 			keysToDelete = append(keysToDelete, key.(string))
 		}

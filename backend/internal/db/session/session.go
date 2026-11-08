@@ -10,9 +10,6 @@ import (
 	"time"
 
 	"github.com/lib/pq"
-	"go.opentelemetry.io/otel/attribute"
-	"go.opentelemetry.io/otel/codes"
-	"go.opentelemetry.io/otel/trace"
 
 	"github.com/ConfabulousDev/confab-web/internal/db"
 	"github.com/ConfabulousDev/confab-web/internal/models"
@@ -20,20 +17,20 @@ import (
 
 // paramBuilder tracks $N indices for dynamic SQL parameter construction.
 type paramBuilder struct {
-	args    []interface{}
+	args    []any
 	nextIdx int
 }
 
 // newParamBuilder creates a paramBuilder with $1 = userID.
 func newParamBuilder(userID int64) *paramBuilder {
 	return &paramBuilder{
-		args:    []interface{}{userID},
+		args:    []any{userID},
 		nextIdx: 2,
 	}
 }
 
 // add appends a value and returns its $N placeholder.
-func (pb *paramBuilder) add(val interface{}) string {
+func (pb *paramBuilder) add(val any) string {
 	placeholder := fmt.Sprintf("$%d", pb.nextIdx)
 	pb.args = append(pb.args, val)
 	pb.nextIdx++
@@ -63,28 +60,19 @@ func lowercaseSlice(ss []string) []string {
 
 // ListUserSessions returns all sessions visible to a user (owned + shared) with deduplication.
 func (s *Store) ListUserSessions(ctx context.Context, userID int64) ([]db.SessionListItem, error) {
-	ctx, span := tracer.Start(ctx, "db.list_user_sessions",
-		trace.WithAttributes(attribute.Int64("user.id", userID)))
-	defer span.End()
-
 	query := s.buildSharedWithMeQuery()
 
 	rows, err := s.conn().QueryContext(ctx, query, userID)
 	if err != nil {
-		span.RecordError(err)
-		span.SetStatus(codes.Error, err.Error())
 		return nil, fmt.Errorf("failed to query sessions: %w", err)
 	}
 	defer rows.Close()
 
 	sessions, err := scanSessionListItems(rows)
 	if err != nil {
-		span.RecordError(err)
-		span.SetStatus(codes.Error, err.Error())
 		return nil, err
 	}
 
-	span.SetAttributes(attribute.Int("sessions.count", len(sessions)))
 	return sessions, nil
 }
 
@@ -129,8 +117,7 @@ func scanSessionListItems(rows *sql.Rows) ([]db.SessionListItem, error) {
 // the visibility predicate has a single source of truth.
 func (s *Store) buildSharedWithMeQuery() string {
 	return `
-		WITH` + githubRefCTEs + `,
-		` + db.VisibleSessionsCTE(s.DB.ShareAllSessions) + `,` + dedupedVisibleCTE + `
+		WITH ` + db.VisibleSessionsCTE(s.DB.ShareAllSessions) + `,` + dedupedVisibleCTE + `
 		SELECT` + sessionSelectCols + `,
 				(d.access_type = 'owner') as is_owner,
 				d.access_type,
@@ -144,32 +131,19 @@ func (s *Store) buildSharedWithMeQuery() string {
 
 // ListUserSessionsPaginated returns filtered, cursor-paginated sessions with pre-materialized filter options.
 func (s *Store) ListUserSessionsPaginated(ctx context.Context, userID int64, params db.SessionListParams) (*db.SessionListResult, error) {
-	ctx, span := tracer.Start(ctx, "db.list_user_sessions_paginated",
-		trace.WithAttributes(attribute.Int64("user.id", userID)))
-	defer span.End()
-
 	if params.PageSize == 0 {
 		params.PageSize = db.DefaultPageSize
 	}
 
 	filterOptions, err := s.queryFilterOptions(ctx, userID)
 	if err != nil {
-		span.RecordError(err)
-		span.SetStatus(codes.Error, err.Error())
 		return nil, err
 	}
 
 	sessions, hasMore, nextCursor, err := s.queryPaginatedSessions(ctx, userID, params)
 	if err != nil {
-		span.RecordError(err)
-		span.SetStatus(codes.Error, err.Error())
 		return nil, err
 	}
-
-	span.SetAttributes(
-		attribute.Int("sessions.count", len(sessions)),
-		attribute.Bool("sessions.has_more", hasMore),
-	)
 
 	return &db.SessionListResult{
 		Sessions:      sessions,
@@ -186,12 +160,18 @@ func (s *Store) ListUserSessionsPaginated(ctx context.Context, userID int64, par
 // ShareAllSessions, the share-all variant returns every session — no separate
 // global path or lookup tables). The wrapper SELECT DISTINCT collapses the
 // UNION-ALL duplicates emitted by the helper (e.g. a recipient who also has a
-// system share to the same session).
+// system share to the same session). The listable set is materialized once so
+// the per-session listability probe runs once rather than per dropdown.
 func (s *Store) queryFilterOptions(ctx context.Context, userID int64) (db.SessionFilterOptions, error) {
 	query := `
 		WITH ` + db.VisibleSessionsCTE(s.DB.ShareAllSessions) + `,
 		visible AS (
 			SELECT DISTINCT vs.id, vs.user_id, vs.owner_email FROM visible_sessions vs
+		),
+		listable AS MATERIALIZED (
+			SELECT s.git_info, v.owner_email
+			FROM visible v JOIN sessions s ON v.id = s.id
+			WHERE ` + db.ListableSessionPredicate("s") + `
 		)
 		SELECT
 			COALESCE(r.repos, ARRAY[]::text[]) as repos,
@@ -199,16 +179,13 @@ func (s *Store) queryFilterOptions(ctx context.Context, userID int64) (db.Sessio
 			COALESCE(o.owners, ARRAY[]::text[]) as owners
 		FROM
 			(SELECT array_agg(DISTINCT ` + db.RepoRootExpr("s") + ` ORDER BY ` + db.RepoRootExpr("s") + `) as repos
-			 FROM visible v JOIN sessions s ON v.id = s.id
-			 WHERE s.git_info->>'repo_url' IS NOT NULL
-			   AND ` + db.ListableSessionPredicate("s") + `) r,
+			 FROM listable s
+			 WHERE s.git_info->>'repo_url' IS NOT NULL) r,
 			(SELECT array_agg(DISTINCT s.git_info->>'branch' ORDER BY s.git_info->>'branch') as branches
-			 FROM visible v JOIN sessions s ON v.id = s.id
-			 WHERE s.git_info->>'branch' IS NOT NULL
-			   AND ` + db.ListableSessionPredicate("s") + `) b,
-			(SELECT array_agg(DISTINCT LOWER(v.owner_email) ORDER BY LOWER(v.owner_email)) as owners
-			 FROM visible v JOIN sessions s ON v.id = s.id
-			 WHERE ` + db.ListableSessionPredicate("s") + `) o
+			 FROM listable s
+			 WHERE s.git_info->>'branch' IS NOT NULL) b,
+			(SELECT array_agg(DISTINCT LOWER(s.owner_email) ORDER BY LOWER(s.owner_email)) as owners
+			 FROM listable s) o
 	`
 
 	var repos, branches, owners []string
@@ -340,24 +317,25 @@ var sessionSelectCols = `
 				COALESCE(gcr.commits, ARRAY[]::text[]) as github_commits,
 				` + db.V2TotalCostExpr("v")
 
+// sessionStatsJoins attaches per-session file stats and GitHub refs as LATERAL
+// subqueries keyed on s.id, so each costs one index probe per returned row
+// rather than aggregating all of sync_files / session_github_links up front.
 var sessionStatsJoins = `
-			LEFT JOIN (
-				SELECT session_id, COUNT(*) as file_count, SUM(last_synced_line) as total_lines
-				FROM sync_files GROUP BY session_id
-			) sf_stats ON s.id = sf_stats.session_id
-			LEFT JOIN github_pr_refs gpr ON s.id = gpr.session_id
-			LEFT JOIN github_commit_refs gcr ON s.id = gcr.session_id
+			LEFT JOIN LATERAL (
+				SELECT COUNT(*) as file_count, SUM(sf.last_synced_line) as total_lines
+				FROM sync_files sf WHERE sf.session_id = s.id
+			) sf_stats ON true
+			LEFT JOIN LATERAL (
+				SELECT array_agg(sgl.url ORDER BY sgl.created_at) as prs
+				FROM session_github_links sgl
+				WHERE sgl.session_id = s.id AND sgl.link_type = 'pull_request'
+			) gpr ON true
+			LEFT JOIN LATERAL (
+				SELECT array_agg(sgl.ref ORDER BY sgl.created_at DESC) as commits
+				FROM session_github_links sgl
+				WHERE sgl.session_id = s.id AND sgl.link_type = 'commit'
+			) gcr ON true
 			LEFT JOIN session_card_tokens_v2 v ON s.id = v.session_id`
-
-const githubRefCTEs = `
-		github_pr_refs AS (
-			SELECT session_id, array_agg(url ORDER BY created_at) as prs
-			FROM session_github_links WHERE link_type = 'pull_request' GROUP BY session_id
-		),
-		github_commit_refs AS (
-			SELECT session_id, array_agg(ref ORDER BY created_at DESC) as commits
-			FROM session_github_links WHERE link_type = 'commit' GROUP BY session_id
-		)`
 
 // dedupedVisibleCTE wraps db.VisibleSessionsCTE with a DISTINCT ON (id) pass
 // that picks the highest-priority access_type per session: owner > private_share > system_share.
@@ -376,26 +354,52 @@ const dedupedVisibleCTE = `
 			END
 		)`
 
-// CF-495: single SQL shape for paginated session listing — routes visibility
-// through db.VisibleSessionsCTE so both default and share-all modes share the
-// same column projection. Owner filter applied uniformly on the deduped
-// visible CTE (d.owner_email). access_type / shared_by_email come from the
-// helper rather than per-branch CASE expressions.
-func (s *Store) buildFilteredSessionsQuery(userID int64, params db.SessionListParams) (string, []interface{}) {
+// visibleSessionsLateral is the share-all counterpart to deduped_visible: it
+// resolves each session's highest-priority access with a per-session probe of
+// visible_sessions, so LIMIT applies before any per-row work instead of after
+// deduplicating every session in the org. With per-user visibility the visible
+// set is small and deduped_visible stays the cheaper starting side.
+const visibleSessionsLateral = `
+			FROM sessions s
+			CROSS JOIN LATERAL (
+				SELECT vs.owner_email, vs.access_type, vs.shared_by_email
+				FROM visible_sessions vs
+				WHERE vs.id = s.id
+				ORDER BY CASE vs.access_type
+					WHEN 'owner' THEN 1
+					WHEN 'private_share' THEN 2
+					WHEN 'system_share' THEN 3
+					ELSE 4
+				END
+				LIMIT 1
+			) d`
+
+// CF-495: paginated session listing routes visibility through
+// db.VisibleSessionsCTE, so both default and share-all modes share one
+// predicate and column projection; only the join that resolves each session's
+// access differs (deduped_visible vs visibleSessionsLateral). Owner filter
+// applies to d.owner_email in both.
+func (s *Store) buildFilteredSessionsQuery(userID int64, params db.SessionListParams) (string, []any) {
 	pb := newParamBuilder(userID)
 	commonFilters, ownerFilter, searchJoin := buildPushdownFilters(pb, params)
 	limitP := pb.add(params.PageSize + 1)
 
+	visibleCTEs := db.VisibleSessionsCTE(s.DB.ShareAllSessions) + `,` + dedupedVisibleCTE
+	from := `
+			FROM deduped_visible d
+			JOIN sessions s ON d.id = s.id`
+	if s.DB.ShareAllSessions {
+		visibleCTEs = db.VisibleSessionsCTE(true)
+		from = visibleSessionsLateral
+	}
+
 	query := `
-		WITH` + githubRefCTEs + `,
-		` + db.VisibleSessionsCTE(s.DB.ShareAllSessions) + `,` + dedupedVisibleCTE + `
+		WITH ` + visibleCTEs + `
 		SELECT` + sessionSelectCols + `,
 				(d.access_type = 'owner') as is_owner,
 				d.access_type,
 				d.shared_by_email,
-				d.owner_email
-			FROM deduped_visible d
-			JOIN sessions s ON d.id = s.id` + sessionStatsJoins + searchJoin + `
+				d.owner_email` + from + sessionStatsJoins + searchJoin + `
 			WHERE 1=1` + commonFilters + ownerFilter
 
 	if params.Cursor != "" {
@@ -449,13 +453,6 @@ func (s *Store) queryPaginatedSessions(ctx context.Context, userID int64, params
 
 // GetSessionDetail returns detailed information about a session by its UUID primary key
 func (s *Store) GetSessionDetail(ctx context.Context, sessionID string, userID int64) (*db.SessionDetail, error) {
-	ctx, span := tracer.Start(ctx, "db.get_session_detail",
-		trace.WithAttributes(
-			attribute.String("session.id", sessionID),
-			attribute.Int64("user.id", userID),
-		))
-	defer span.End()
-
 	var session db.SessionDetail
 	var gitInfoBytes []byte
 	// Column list and Scan targets live in db/session_detail.go so this
@@ -474,20 +471,14 @@ func (s *Store) GetSessionDetail(ctx context.Context, sessionID string, userID i
 		if err == sql.ErrNoRows || db.IsInvalidUUIDError(err) {
 			return nil, db.ErrSessionNotFound
 		}
-		span.RecordError(err)
-		span.SetStatus(codes.Error, err.Error())
 		return nil, fmt.Errorf("failed to get session: %w", err)
 	}
 	session.Provider = models.NormalizeProvider(session.Provider)
 
 	if err := db.UnmarshalSessionGitInfo(&session, gitInfoBytes); err != nil {
-		span.RecordError(err)
-		span.SetStatus(codes.Error, err.Error())
 		return nil, err
 	}
 	if err := db.LoadSessionSyncFiles(ctx, s.DB, &session); err != nil {
-		span.RecordError(err)
-		span.SetStatus(codes.Error, err.Error())
 		return nil, err
 	}
 
@@ -496,17 +487,8 @@ func (s *Store) GetSessionDetail(ctx context.Context, sessionID string, userID i
 
 // DeleteSessionFromDB deletes an entire session and all its runs from the database
 func (s *Store) DeleteSessionFromDB(ctx context.Context, sessionID string, userID int64) error {
-	ctx, span := tracer.Start(ctx, "db.delete_session",
-		trace.WithAttributes(
-			attribute.String("session.id", sessionID),
-			attribute.Int64("user.id", userID),
-		))
-	defer span.End()
-
 	result, err := s.conn().ExecContext(ctx, `DELETE FROM sessions WHERE id = $1 AND user_id = $2`, sessionID, userID)
 	if err != nil {
-		span.RecordError(err)
-		span.SetStatus(codes.Error, err.Error())
 		return fmt.Errorf("failed to delete session: %w", err)
 	}
 
@@ -522,61 +504,34 @@ func (s *Store) DeleteSessionFromDB(ctx context.Context, sessionID string, userI
 // It returns the session's external_id and the canonical provider value
 // (legacy 'Claude Code' rows are normalized to 'claude-code' here).
 func (s *Store) VerifySessionOwnership(ctx context.Context, sessionID string, userID int64) (externalID string, provider string, err error) {
-	ctx, span := tracer.Start(ctx, "db.verify_session_ownership",
-		trace.WithAttributes(
-			attribute.String("session.id", sessionID),
-			attribute.Int64("user.id", userID),
-		))
-	defer span.End()
-
 	query := `SELECT external_id, session_type FROM sessions WHERE id = $1 AND user_id = $2`
 	err = s.conn().QueryRowContext(ctx, query, sessionID, userID).Scan(&externalID, &provider)
 	if err == sql.ErrNoRows {
 		var exists bool
 		checkQuery := `SELECT EXISTS(SELECT 1 FROM sessions WHERE id = $1)`
 		if checkErr := s.conn().QueryRowContext(ctx, checkQuery, sessionID).Scan(&exists); checkErr != nil {
-			span.RecordError(checkErr)
-			span.SetStatus(codes.Error, checkErr.Error())
 			return "", "", fmt.Errorf("failed to check session existence: %w", checkErr)
 		}
 		if exists {
-			span.SetAttributes(attribute.String("result", "forbidden"))
 			return "", "", db.ErrForbidden
 		}
-		span.SetAttributes(attribute.String("result", "not_found"))
 		return "", "", db.ErrSessionNotFound
 	}
 	if err != nil {
 		if db.IsInvalidUUIDError(err) {
-			span.SetAttributes(attribute.String("result", "not_found"))
 			return "", "", db.ErrSessionNotFound
 		}
-		span.RecordError(err)
-		span.SetStatus(codes.Error, err.Error())
 		return "", "", fmt.Errorf("failed to verify session ownership: %w", err)
 	}
 	provider = models.NormalizeProvider(provider)
-	span.SetAttributes(
-		attribute.String("result", "owner"),
-		attribute.String("session.provider", provider),
-	)
 	return externalID, provider, nil
 }
 
 // UpdateSessionSummary updates the summary field for a session identified by external_id
 func (s *Store) UpdateSessionSummary(ctx context.Context, externalID string, userID int64, summary string) error {
-	ctx, span := tracer.Start(ctx, "db.update_session_summary",
-		trace.WithAttributes(
-			attribute.String("session.external_id", externalID),
-			attribute.Int64("user.id", userID),
-		))
-	defer span.End()
-
 	query := `UPDATE sessions SET summary = $1 WHERE external_id = $2 AND user_id = $3`
 	result, err := s.conn().ExecContext(ctx, query, summary, externalID, userID)
 	if err != nil {
-		span.RecordError(err)
-		span.SetStatus(codes.Error, err.Error())
 		return fmt.Errorf("failed to update session summary: %w", err)
 	}
 
@@ -600,13 +555,6 @@ func (s *Store) UpdateSessionSummary(ctx context.Context, externalID string, use
 
 // UpdateSessionCustomTitle updates the custom_title field for a session identified by UUID
 func (s *Store) UpdateSessionCustomTitle(ctx context.Context, sessionID string, userID int64, customTitle *string) error {
-	ctx, span := tracer.Start(ctx, "db.update_session_custom_title",
-		trace.WithAttributes(
-			attribute.String("session.id", sessionID),
-			attribute.Int64("user.id", userID),
-		))
-	defer span.End()
-
 	query := `UPDATE sessions SET custom_title = $1 WHERE id = $2 AND user_id = $3`
 	result, err := s.conn().ExecContext(ctx, query, customTitle, sessionID, userID)
 	if err != nil {
@@ -639,10 +587,6 @@ func (s *Store) UpdateSessionCustomTitle(ctx context.Context, sessionID string, 
 
 // UpdateSessionSuggestedTitle updates the suggested_session_title field for a session.
 func (s *Store) UpdateSessionSuggestedTitle(ctx context.Context, sessionID string, suggestedTitle string) error {
-	ctx, span := tracer.Start(ctx, "db.update_session_suggested_title",
-		trace.WithAttributes(attribute.String("session.id", sessionID)))
-	defer span.End()
-
 	if suggestedTitle == "" {
 		return nil
 	}
@@ -650,8 +594,6 @@ func (s *Store) UpdateSessionSuggestedTitle(ctx context.Context, sessionID strin
 	query := `UPDATE sessions SET suggested_session_title = $1 WHERE id = $2`
 	_, err := s.conn().ExecContext(ctx, query, suggestedTitle, sessionID)
 	if err != nil {
-		span.RecordError(err)
-		span.SetStatus(codes.Error, err.Error())
 		return fmt.Errorf("failed to update suggested session title: %w", err)
 	}
 	return nil
@@ -665,45 +607,26 @@ func (s *Store) UpdateSessionSuggestedTitle(ctx context.Context, sessionID strin
 // file read, transcript download) that don't go through the owner-only
 // VerifySessionOwnership route.
 func (s *Store) GetSessionOwnerExternalIDAndProvider(ctx context.Context, sessionID string) (userID int64, externalID string, provider string, err error) {
-	ctx, span := tracer.Start(ctx, "db.get_session_owner_external_id_and_provider",
-		trace.WithAttributes(attribute.String("session.id", sessionID)))
-	defer span.End()
-
 	query := `SELECT user_id, external_id, session_type FROM sessions WHERE id = $1`
 	err = s.conn().QueryRowContext(ctx, query, sessionID).Scan(&userID, &externalID, &provider)
 	if err != nil {
 		if err == sql.ErrNoRows {
 			return 0, "", "", db.ErrSessionNotFound
 		}
-		span.RecordError(err)
-		span.SetStatus(codes.Error, err.Error())
 		return 0, "", "", fmt.Errorf("failed to get session: %w", err)
 	}
 	provider = models.NormalizeProvider(provider)
-	span.SetAttributes(
-		attribute.Int64("user.id", userID),
-		attribute.String("session.provider", provider),
-	)
 	return userID, externalID, provider, nil
 }
 
 // GetSessionIDByExternalID looks up the internal session ID by external_id for a specific user.
 func (s *Store) GetSessionIDByExternalID(ctx context.Context, externalID string, userID int64) (sessionID string, err error) {
-	ctx, span := tracer.Start(ctx, "db.get_session_id_by_external_id",
-		trace.WithAttributes(
-			attribute.String("session.external_id", externalID),
-			attribute.Int64("user.id", userID),
-		))
-	defer span.End()
-
 	query := `SELECT id FROM sessions WHERE external_id = $1 AND user_id = $2`
 	err = s.conn().QueryRowContext(ctx, query, externalID, userID).Scan(&sessionID)
 	if err != nil {
 		if err == sql.ErrNoRows {
 			return "", db.ErrSessionNotFound
 		}
-		span.RecordError(err)
-		span.SetStatus(codes.Error, err.Error())
 		return "", fmt.Errorf("failed to get session: %w", err)
 	}
 	return sessionID, nil

@@ -1,7 +1,6 @@
 package analytics
 
 import (
-	"bytes"
 	"context"
 	"os"
 	"path/filepath"
@@ -11,8 +10,6 @@ import (
 	"github.com/ConfabulousDev/confab-web/internal/codex"
 	"github.com/shopspring/decimal"
 )
-
-func ptrInt64(v int64) *int64 { return &v }
 
 // minimalRollout builds a hand-crafted ParsedRollout with the minimum fields
 // each test needs. Avoids depending on the parser implementation (which is
@@ -28,7 +25,7 @@ func minimalRollout() *codex.ParsedRollout {
 				TurnID:      "t1",
 				StartedAt:   &started,
 				CompletedAt: &completed,
-				DurationMs:  ptrInt64(11000),
+				DurationMs:  new(int64(11000)),
 				Model:       "gpt-5",
 				UserMessages: []codex.Message{
 					{Role: "user", Text: "add the linear mcp"},
@@ -173,9 +170,10 @@ func TestComputeFromCodexRollout_ApplyPatch(t *testing.T) {
 	if out.LanguageBreakdown["python"] != 1 && out.LanguageBreakdown["py"] != 1 {
 		t.Errorf("LanguageBreakdown missing python/py entry: %v", out.LanguageBreakdown)
 	}
-	// Codex has no Read tool — FilesRead must stay zero.
+	// This rollout carries no ParsedCommandKinds (the <=0.130.0 shape), so
+	// FilesRead must stay zero (m2ky).
 	if out.FilesRead != 0 {
-		t.Errorf("FilesRead = %d, want 0 (Codex has no Read tool)", out.FilesRead)
+		t.Errorf("FilesRead = %d, want 0 (no parsed_cmd on this rollout)", out.FilesRead)
 	}
 }
 
@@ -508,7 +506,7 @@ func TestComputeFromCodexRollout_ParentFixture_PopulatesAgents(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read fixture: %v", err)
 	}
-	rollout, err := codex.ParseRollout(bytes.NewReader(raw))
+	rollout, err := codex.ParseRollout(raw)
 	if err != nil {
 		t.Fatalf("ParseRollout: %v", err)
 	}
@@ -536,7 +534,7 @@ func TestComputeFromCodexRollout_SkillFixture_PopulatesSkills(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read fixture: %v", err)
 	}
-	rollout, err := codex.ParseRollout(bytes.NewReader(raw))
+	rollout, err := codex.ParseRollout(raw)
 	if err != nil {
 		t.Fatalf("ParseRollout: %v", err)
 	}
@@ -558,7 +556,7 @@ func TestComputeFromCodexRollout_NoSpawnAgentInTools(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read fixture: %v", err)
 	}
-	rollout, err := codex.ParseRollout(bytes.NewReader(raw))
+	rollout, err := codex.ParseRollout(raw)
 	if err != nil {
 		t.Fatalf("ParseRollout: %v", err)
 	}
@@ -576,7 +574,7 @@ func TestComputeFromCodexRollout_NoWaitAgentInTools(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read fixture: %v", err)
 	}
-	rollout, err := codex.ParseRollout(bytes.NewReader(raw))
+	rollout, err := codex.ParseRollout(raw)
 	if err != nil {
 		t.Fatalf("ParseRollout: %v", err)
 	}
@@ -596,7 +594,7 @@ func TestComputeFromCodexRollout_ConversationTimingUnchanged_NoSpawnFixture(t *t
 	if err != nil {
 		t.Fatalf("read fixture: %v", err)
 	}
-	rollout, err := codex.ParseRollout(bytes.NewReader(raw))
+	rollout, err := codex.ParseRollout(raw)
 	if err != nil {
 		t.Fatalf("ParseRollout: %v", err)
 	}

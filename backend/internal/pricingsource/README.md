@@ -32,6 +32,80 @@ confabulous.dev at runtime; only the canonical instance ships the authoritative
 - `(*Source).Effective(ctx) Document` — the freshest valid table: a remote document when reachable, valid, and strictly newer than the embedded floor; otherwise the embedded floor (or the last-good remote). Lazy refresh (2h success / 15m failure), keeps last-good, never blocks beyond the request timeout.
 - `(*Source).RefreshInterval()` — success TTL, used for the endpoint's `Cache-Control: max-age`.
 
+## Rate conventions
+
+`Rate` is a single flat set of numbers per family (`input`, `output`,
+`cacheWrite`, `cacheWrite1h`, `cacheRead`). Real vendor pricing carries
+dimensions that shape cannot express, so the table follows fixed conventions.
+Read these before adding or repricing a row.
+
+- **Never encode a future price change.** A rate that is scheduled to change,
+  and a promotional rate with a known expiry, are both stored as the flat rate
+  in effect *today*. Put a calendar reminder to edit the table on the date; do
+  not write code that switches price on a timer. We shipped exactly that once —
+  a Sonnet 5 increase encoded ahead of time, then cancelled by the vendor, which
+  overcharged every Sonnet 5 session by 50% from the day the cutover fired.
+  Rates currently promotional: `gpt-5.6-sol` ($4/$20, ~Nov 21 2026) and
+  `gemini-3.6/3.7/3.8-flash` ($0.75/$3.75 through Dec 31 2026, reverting to
+  $1.50/$7.50 with a $0.15 cache read).
+- **Context-tiered models take the low/short-context tier.** Every Gemini Pro,
+  every Grok model, the OpenAI long-context tiers, and Claude Haiku 5.5 bill
+  more above a token threshold (200k for Gemini/Grok, 272k for OpenAI, 100k for
+  Haiku 5.5 — where every column is 5x, $0.50/$2.50 against $0.10/$0.50). The
+  family key derives from the model name, so nothing in the compute path could
+  pick a tier per request.
+  The ≤200k / short-context rate is stored, which understates requests above the
+  threshold — sharpest on `gpt-6-astra`, whose 1.05M context makes >272k requests
+  routine and where the long-context tier is 2x input / 1.5x output, with a
+  $25/MTok cache write against the short-context $12.50. Fixing the class needs
+  per-turn token accounting; tracked separately.
+- **Cache reads are 0.1x base input — except Fable 5.1, Mythos 5.1, Opus 5.5,
+  Sonnet 5.5, GPT-6.1 Sol and GPT-6.1 Terra.** Fable 5.1 and Mythos 5.1 bill
+  cache hits at 0.025x ($0.25/MTok against $10 input); Claude Opus 5.5 bills them at 0.05x
+  ($0.20/MTok against $4 input); Claude Sonnet 5.5 bills them at 0.05x
+  ($0.10/MTok against $2 input — halved from $0.20 on 2026-10-07, while
+  `sonnet-5` stays at 0.1x); OpenAI's `gpt-6.1-sol` bills them at 0.05x
+  ($0.10/MTok against $2 input — half of `gpt-6-sol`'s $0.20), and
+  `gpt-6.1-terra` likewise ($0.05/MTok against $1 input). The 5.0
+  generation (`fable-5`, `mythos-5`) stays at 0.1x ($1.00). Cache reads
+  dominate token volume in agentic sessions, so "normalizing" any exception is
+  a silent overcharge: 4x for the 5.1 rows at $1.00, 2x for Opus 5.5 at $0.40
+  and for Sonnet 5.5 and `gpt-6.1-sol` at $0.20 and `gpt-6.1-terra` at $0.10.
+  Pinned by tests in `internal/analytics/pricing_test.go`.
+- **OpenAI cache writes are 1.25x short-context input on the 5.6 and 6
+  families** — the 30-minute retention tier, stored in `cacheWrite`
+  (`gpt-6-astra` $12.50, `gpt-6.1-sol` $2.50, `gpt-6.1-terra` $1.25,
+  `gpt-6-sol` $2.50, `gpt-6-luna` $0.125, `gpt-5.6-sol` $5.00, `gpt-5.6-terra` $2.50,
+  `gpt-5.6-luna` $0.25, `gpt-5.6-cyber` $15.625). Older OpenAI families publish
+  no cache-write price and stay at 0 pending verification; the `-pro` models
+  offer no caching at all, so both cache columns are 0 for them. `cacheWrite1h`
+  is 0 on every OpenAI row — OpenAI has no 1-hour tier, and consumers fall back
+  to `cacheWrite`. OpenAI's 12-hour retention tier (since 2026-10-20, 2.5x
+  input) is not stored: it maps to neither column. These rates bill nothing
+  today: the Codex rollout wire carries no cache-write token count, so the
+  analyzer has no tokens to apply them to (tracked in `md0z`).
+- **DeepSeek V4 is stored at off-peak rates.** DeepSeek bills peak during
+  01:00–04:00 and 06:00–10:00 UTC Mon–Fri and half that otherwise — 35 of 168
+  hours, so off-peak covers ~79% of wall-clock time and is the better
+  single-value estimate. Peak equivalents are exactly 2x: `deepseek-v4-flash`
+  $0.44/$1.32 with a $0.014 cache read, `deepseek-v4-pro` $1.32/$3.96 with
+  $0.044.
+- **Mistral rows carry `cacheRead: 0`.** Mistral advertises cached input at up to
+  90% off but publishes no per-model cached rate, so cache hits bill at the full
+  input rate. That errs high, never low.
+- **Gemini Flash rows take the text/image/video tier.** Audio input is priced
+  higher and the transcript gives us no way to tell the modalities apart.
+- **Retired models keep their rows.** Historical sessions still reference them,
+  and deleting a key silently reprices those sessions to $0 rather than failing
+  loudly.
+- **Keys must match the wire string byte for byte.** For non-Claude, non-OpenAI
+  names `getModelFamily` passes the model id straight through, so a key that
+  misspells the vendor's API model id is invisible: no error, no distinct
+  warning, the model just stays unpriced at $0. Use the exact API model id from
+  vendor docs (`mistral-medium-3504`, not `mistral-medium-3.5`). After adding
+  rows, check `GET /api/v1/admin/unpriced-models` — anything still listed there
+  is a spelling mismatch, not a missing price.
+
 ## Invariants
 
 - **Leaf package.** Must not import `internal/analytics` or `internal/api`. It is app-agnostic: it reads only the `PRICING_*` env vars and takes a `forceDisabled` bool — it does **not** know about `ENABLE_SAAS_FOOTER` (the composition roots pass that in).

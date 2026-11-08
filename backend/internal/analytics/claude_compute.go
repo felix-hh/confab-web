@@ -4,11 +4,8 @@ import (
 	"context"
 	"io"
 	"log/slog"
-	"time"
 
 	"github.com/ConfabulousDev/confab-web/internal/logger"
-	"go.opentelemetry.io/otel/attribute"
-	"go.opentelemetry.io/otel/trace"
 )
 
 // AgentProvider yields the next parsed agent file, or io.EOF when done.
@@ -30,7 +27,6 @@ func ComputeFromJSONL(ctx context.Context, content []byte) (*ComputeResult, erro
 
 // ComputeFromFileCollection computes analytics from a FileCollection.
 // Delegates to ComputeStreaming with an adapter that yields agents from the in-memory collection.
-// sessionAt defaults to time.Time{} (zero value, before Sep 1 2026) for this convenience path.
 func ComputeFromFileCollection(ctx context.Context, fc *FileCollection) (*ComputeResult, error) {
 	idx := 0
 	agentProvider := func(_ context.Context) (*TranscriptFile, error) {
@@ -42,7 +38,7 @@ func ComputeFromFileCollection(ctx context.Context, fc *FileCollection) (*Comput
 		return agent, nil
 	}
 
-	return ComputeStreaming(ctx, fc.Main, agentProvider, nil, time.Time{})
+	return ComputeStreaming(ctx, fc.Main, agentProvider, nil)
 }
 
 // WorkflowInputs carries the side data the WorkflowsAnalyzer needs that the
@@ -62,22 +58,13 @@ type WorkflowInputs struct {
 // wf is optional: when non-nil, the WorkflowsAnalyzer is driven explicitly
 // alongside the generic processors (it is not a FileProcessor — see
 // analyzer_workflows.go).
-//
-// sessionAt is the session's first_seen timestamp for date-aware pricing.
-// A zero time.Time is safe and routes to introductory pricing (before Sep 1 2026).
-func ComputeStreaming(ctx context.Context, main *TranscriptFile, agentProvider AgentProvider, wf *WorkflowInputs, sessionAt time.Time) (*ComputeResult, error) {
-	ctx, span := tracer.Start(ctx, "analytics.compute_streaming",
-		trace.WithAttributes(
-			attribute.Int64("main.lines", int64(len(main.Lines))),
-		))
-	defer span.End()
-
+func ComputeStreaming(ctx context.Context, main *TranscriptFile, agentProvider AgentProvider, wf *WorkflowInputs) (*ComputeResult, error) {
 	// Session-scoped logger (upstream enriches it with session_id + provider) so
 	// any unknown-model pricing warning is traceable.
 	log := logger.Ctx(ctx)
 
 	// Initialize all analyzers
-	tokensAnalyzer := &TokensAnalyzer{log: log, sessionAt: sessionAt}
+	tokensAnalyzer := &TokensAnalyzer{log: log}
 	sessionAnalyzer := &SessionAnalyzer{}
 	toolsAnalyzer := &ToolsAnalyzer{}
 	codeActivityAnalyzer := &CodeActivityAnalyzer{}
@@ -106,7 +93,7 @@ func ComputeStreaming(ctx context.Context, main *TranscriptFile, agentProvider A
 	// runId per agent + the run journals, neither of which the generic loop models.
 	var workflowsAnalyzer *WorkflowsAnalyzer
 	if wf != nil {
-		workflowsAnalyzer = &WorkflowsAnalyzer{log: log, sessionAt: sessionAt}
+		workflowsAnalyzer = &WorkflowsAnalyzer{log: log}
 	}
 
 	// Phase 2: Stream agent files one at a time
@@ -151,11 +138,6 @@ func ComputeStreaming(ctx context.Context, main *TranscriptFile, agentProvider A
 		}
 		workflowRuns = workflowsAnalyzer.Result()
 	}
-
-	span.SetAttributes(
-		attribute.Int("agent_files.processed", len(agentFilesSeen)),
-		attribute.Int("agent_files.skipped", skippedAgentFiles),
-	)
 
 	// Build result from analyzer outputs
 	tokens := tokensAnalyzer.Result()

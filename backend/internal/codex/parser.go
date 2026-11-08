@@ -1,20 +1,22 @@
 package codex
 
 import (
-	"bufio"
 	"bytes"
 	"encoding/json"
 	"fmt"
-	"io"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
 )
 
-// maxLineBytes is the bufio.Scanner buffer cap. Codex assistant outputs and
-// patch payloads occasionally run into the hundreds of KB.
-const maxLineBytes = 4 * 1024 * 1024
+// maxLineBytes is the longest rollout line ParseRollout decodes; a longer line
+// is skipped with a ValidationError instead of aborting the parse. Command
+// output is inlined into its line, so real lines reach several MB. The cap
+// sits above the 16 MB upload body bound (api.MaxBodyXL) on purpose: it never
+// drops uploaded data and only guards inputs that came another way.
+const maxLineBytes = 32 * 1024 * 1024
 
 // envContextPattern strips the <environment_context>…</environment_context>
 // preamble Codex injects on the first user message. Matches greedily across
@@ -43,7 +45,7 @@ var skillsInstructionsBlockPattern = regexp.MustCompile(`(?s)<skills_instruction
 
 // skillCatalogEntryPattern matches one bullet from the Available skills list:
 //
-//	- <name>: <description> (file: <path>)
+//   - <name>: <description> (file: <path>)
 var skillCatalogEntryPattern = regexp.MustCompile(`^-\s+(\S+?):\s+(.+?)\s+\(file:\s+(.+?)\)\s*$`)
 
 // maxCompletionTextLen caps SubagentSpawn.CompletionText to keep ParsedRollout
@@ -74,27 +76,35 @@ type payloadType struct {
 	Type string `json:"type"`
 }
 
-// ParseRollout streams a Codex JSONL file and returns a normalized rollout.
-// See package documentation for the parsing contract.
-func ParseRollout(r io.Reader) (*ParsedRollout, error) {
+// ParseRollout parses a Codex JSONL file and returns a normalized rollout.
+// See package documentation for the parsing contract. The error return is kept
+// for API stability; ParseRollout always returns a nil error.
+func ParseRollout(raw []byte) (*ParsedRollout, error) {
 	rollout := &ParsedRollout{
-		GitInfo: map[string]interface{}{},
+		GitInfo: map[string]any{},
 	}
 	p := &parser{out: rollout}
 
-	scanner := bufio.NewScanner(r)
-	scanner.Buffer(make([]byte, 64*1024), maxLineBytes)
-
 	lineNum := 0
-	for scanner.Scan() {
+	for data := range bytes.Lines(raw) {
 		lineNum++
-		if len(bytes.TrimSpace(scanner.Bytes())) == 0 {
+		// Drop "\n" then one "\r", as bufio.ScanLines does.
+		data = bytes.TrimSuffix(bytes.TrimSuffix(data, []byte("\n")), []byte("\r"))
+		if len(bytes.TrimSpace(data)) == 0 {
 			continue
 		}
 		rollout.TotalLines++
 
+		if len(data) > maxLineBytes {
+			rollout.ValidationErrors = append(rollout.ValidationErrors, ValidationError{
+				Line:   lineNum,
+				Reason: fmt.Sprintf("line exceeds %d MiB cap (%d bytes); skipped", maxLineBytes>>20, len(data)),
+			})
+			continue
+		}
+
 		var line rawLine
-		if err := json.Unmarshal(scanner.Bytes(), &line); err != nil {
+		if err := json.Unmarshal(data, &line); err != nil {
 			rollout.ValidationErrors = append(rollout.ValidationErrors, ValidationError{
 				Line:   lineNum,
 				Reason: "JSON decode: " + err.Error(),
@@ -104,9 +114,6 @@ func ParseRollout(r io.Reader) (*ParsedRollout, error) {
 
 		ts, _ := time.Parse(time.RFC3339Nano, line.Timestamp)
 		p.dispatch(line.Type, ts, line.Payload, lineNum)
-	}
-	if err := scanner.Err(); err != nil {
-		return nil, fmt.Errorf("scan rollout: %w", err)
 	}
 
 	p.closeOpenTurn()
@@ -166,17 +173,17 @@ func (p *parser) dispatch(typ string, ts time.Time, payload json.RawMessage, lin
 // ----------------------------------------------------------------------------
 
 type sessionMetaPayload struct {
-	Model         string                 `json:"model"`
-	ModelProvider string                 `json:"model_provider"`
-	CWD           string                 `json:"cwd"`
-	Git           map[string]interface{} `json:"git"`
-	CLIVersion    string                 `json:"cli_version"`
-	Source        json.RawMessage        `json:"source"`
-	ThreadSource  string                 `json:"thread_source"`
-	AgentNickname string                 `json:"agent_nickname"`
-	AgentRole     string                 `json:"agent_role"`
-	AgentType     string                 `json:"agent_type"` // legacy alias for agent_role
-	AgentPath     string                 `json:"agent_path"`
+	Model         string          `json:"model"`
+	ModelProvider string          `json:"model_provider"`
+	CWD           string          `json:"cwd"`
+	Git           map[string]any  `json:"git"`
+	CLIVersion    string          `json:"cli_version"`
+	Source        json.RawMessage `json:"source"`
+	ThreadSource  string          `json:"thread_source"`
+	AgentNickname string          `json:"agent_nickname"`
+	AgentRole     string          `json:"agent_role"`
+	AgentType     string          `json:"agent_type"` // legacy alias for agent_role
+	AgentPath     string          `json:"agent_path"`
 }
 
 // subAgentSourceWrapper decodes the {"sub_agent":{...}} variant. The inner
@@ -323,8 +330,8 @@ type customToolCallOutputPayload struct {
 }
 
 type webSearchCallPayload struct {
-	Status string                 `json:"status"`
-	Action map[string]interface{} `json:"action"`
+	Status string         `json:"status"`
+	Action map[string]any `json:"action"`
 }
 
 func (p *parser) handleResponseItem(ts time.Time, raw json.RawMessage, lineNum int) {
@@ -506,7 +513,7 @@ func extractSkillsCatalog(text string) []SkillAvailable {
 	}
 	var inAvailable bool
 	var out []SkillAvailable
-	for _, line := range strings.Split(body, "\n") {
+	for line := range strings.SplitSeq(body, "\n") {
 		trimmed := strings.TrimSpace(line)
 		if strings.HasPrefix(trimmed, "### Available skills") {
 			inAvailable = true
@@ -859,9 +866,155 @@ func (p *parser) handleEventMsg(ts time.Time, raw json.RawMessage, lineNum int) 
 		if ref, ok := p.callIndex[pae.CallID]; ok {
 			p.toolCallAt(ref).Status = "failed"
 		}
+	case "item_completed":
+		p.handleItemCompleted(ts, raw)
 	default:
-		// user_message, agent_message, and other event types are intentionally
-		// dropped (redundant with response_item, or pure UI metadata).
+		// px58: recognized-and-dropped event_msg types (mirrors the frontend's
+		// KNOWN_EVENT_PAYLOAD_TYPES recognize-but-silent set). Redundant with
+		// the response_item stream: user_message, agent_message,
+		// agent_reasoning, agent_reasoning_raw_content. Redundant with the
+		// top-level `compacted` line: context_compacted. Redundant with the
+		// paired response_item (already resolved via call_id pairing):
+		// web_search_end, mcp_tool_call_end. Internal thread bookkeeping, no
+		// analytics use today: thread_settings_applied, thread_goal_updated,
+		// thread_rolled_back, sub_agent_activity, entered_review_mode,
+		// exited_review_mode, image_generation_end. Anything else falls here
+		// too and is silently ignored — no crash, no analytics impact.
+	}
+}
+
+// ----------------------------------------------------------------------------
+// event_msg → item_completed (>=0.149.1)
+// ----------------------------------------------------------------------------
+
+// Codex 0.149.1 collapsed user_message, agent_message, patch_apply_end,
+// web_search_end and mcp_tool_call_end into one `item_completed` envelope
+// discriminated by `item.type`.
+//
+// The two streams also inverted. A modern shell run's response_item carries
+// JavaScript in `input` (`const r = await tools.exec_command({cmd:"…"})`),
+// while the structured command, cwd, parsed_cmd and status live only on the
+// event side. The streams cannot be merged: their ids never overlap (`call_…`
+// vs `exec-…`) and their counts diverge, so each consumer reads whichever
+// stream carries its signal.
+
+// eventItemCompletedPayload is the >=0.149.1 event_msg.item_completed payload.
+// It is the single decode of that envelope in this package — handleItemCompleted
+// below dispatches on the item type, and firstuser.go's EventMsgUserText reads
+// the UserMessage case out of the same struct rather than declaring a second
+// copy of the shape.
+type eventItemCompletedPayload struct {
+	Item *completedItem `json:"item"`
+}
+
+// completedItem is the union of the item shapes we consume. Fields belonging to
+// other item types simply stay zero.
+type completedItem struct {
+	Type string `json:"type"`
+
+	// UserMessage / AgentMessage: typed text parts. Real rollouts mix non-text
+	// parts (e.g. `skill`) in here, and sibling item types capitalize the part
+	// type as "Text", so readers match case-insensitively and skip the rest.
+	// EventMsgUserText (firstuser.go) is the reader for the UserMessage case.
+	Content []struct {
+		Type string `json:"type"`
+		Text string `json:"text"`
+	} `json:"content"`
+
+	// CommandExecution: Codex's own classification of the shell line it ran.
+	ParsedCmd []struct {
+		Type string `json:"type"`
+	} `json:"parsed_cmd"`
+
+	// FileChange: one entry per touched path.
+	Changes map[string]struct {
+		Type        string `json:"type"`
+		UnifiedDiff string `json:"unified_diff"`
+		Content     string `json:"content"`
+	} `json:"changes"`
+
+	// Extension: `kind` names the extension that ran.
+	Kind  string `json:"kind"`
+	Query string `json:"query"`
+}
+
+// handleItemCompleted routes a >=0.149.1 item to the turn state its analyzers
+// read. Items are never recorded as tool calls — modern rollouts already
+// surface `exec` and `wait` through response_item, and the two streams are not
+// 1:1, so counting both would double the Tools card.
+func (p *parser) handleItemCompleted(ts time.Time, raw json.RawMessage) {
+	var ev eventItemCompletedPayload
+	if err := json.Unmarshal(raw, &ev); err != nil || ev.Item == nil {
+		return
+	}
+	item := ev.Item
+
+	switch item.Type {
+	case "CommandExecution":
+		kinds := make([]string, 0, len(item.ParsedCmd))
+		for _, cmd := range item.ParsedCmd {
+			if cmd.Type != "" {
+				kinds = append(kinds, cmd.Type)
+			}
+		}
+		if len(kinds) == 0 {
+			return
+		}
+		p.ensureTurn(ts)
+		p.active.ParsedCommandKinds = append(p.active.ParsedCommandKinds, kinds...)
+
+	case "FileChange":
+		if len(item.Changes) == 0 {
+			return
+		}
+		// `changes` is a JSON object, so decode order is unspecified — sort to
+		// keep FileEdits (and every count derived from it) deterministic.
+		paths := make([]string, 0, len(item.Changes))
+		for path := range item.Changes {
+			paths = append(paths, path)
+		}
+		sort.Strings(paths)
+		p.ensureTurn(ts)
+		for _, path := range paths {
+			change := item.Changes[path]
+			p.active.FileEdits = append(p.active.FileEdits, FileEdit{
+				Path:        path,
+				ChangeType:  change.Type,
+				UnifiedDiff: change.UnifiedDiff,
+				Content:     change.Content,
+				Timestamp:   ts,
+			})
+		}
+
+	case "Extension":
+		// `web.search` is where web_search_call went, and the only kind present
+		// in any captured rollout. Synthesize a tool call so modern web
+		// searches count like old ones do (mirroring the <=0.130.0 web_search_call
+		// synthesis in handleResponseItem), under the raw modern name: the tool
+		// vocabulary genuinely changed, and reporting a name that never
+		// appeared in the transcript would misstate the data. Extension items
+		// carry no status field, so the synthesized call is always "completed";
+		// a failed web search is not distinguishable in this format.
+		if item.Kind != "web.search" {
+			return
+		}
+		p.ensureTurn(ts)
+		p.active.ToolCalls = append(p.active.ToolCalls, ToolCall{
+			Name:      "web.search",
+			Arguments: item.Query,
+			Status:    "completed",
+			Timestamp: ts,
+		})
+
+	default:
+		// UserMessage, AgentMessage, Reasoning, ImageView and anything newer are
+		// deliberately not recorded. Modern rollouts carry user and assistant
+		// text in BOTH streams — verified across every captured >=0.149.1
+		// rollout — and the parser already reads response_item for it, so
+		// recording the event copy would double every message count. The one
+		// consumer that needs the event-stream user text (server-side
+		// first_user_message derivation, which runs before parsing) reads it
+		// through EventMsgUserText in firstuser.go.
 	}
 }
 

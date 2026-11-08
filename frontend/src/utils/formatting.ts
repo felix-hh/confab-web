@@ -246,3 +246,21 @@ export function formatRepoName(repoUrl: string): string {
   }
   return repoUrl;
 }
+
+/**
+ * Format a calendar date (YYYY-MM-DD) as e.g. "January 9, 2026". Formatted in
+ * UTC so the date never shifts to the previous day in western time zones.
+ */
+export function formatCalendarDate(isoDate: string): string {
+  return new Date(`${isoDate}T00:00:00Z`).toLocaleDateString('en-US', {
+    timeZone: 'UTC',
+    year: 'numeric',
+    month: 'long',
+    day: 'numeric',
+  });
+}
+
+/** "1 edit", "2 edits"; pass `pluralForm` for irregular plurals ("2 queries"). */
+export function plural(count: number, singular: string, pluralForm = `${singular}s`): string {
+  return `${count} ${count === 1 ? singular : pluralForm}`;
+}

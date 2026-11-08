@@ -2,9 +2,7 @@ package analytics
 
 import (
 	"context"
-	"io"
 	"log/slog"
-	"time"
 
 	"github.com/ConfabulousDev/confab-web/internal/models"
 	"github.com/ConfabulousDev/confab-web/internal/storage"
@@ -13,18 +11,16 @@ import (
 type claudeProvider struct{}
 
 // claudeRollout holds the main transcript plus the deps needed to stream
-// agent files on demand. cachedAgents memoizes parsed agent files after the
-// first traversal so subsequent provider methods reuse them without a second
-// S3 download. Single-goroutine per the Rollout contract; no mutex.
+// agent files on demand. Agents are never memoized: each traversal
+// (ComputeCards, PrepareTranscript, SearchText) streams them one at a time
+// and drops each after processing, so peak memory is O(main) + O(largest
+// agent) rather than O(all agents). A second traversal re-downloads (5m68).
+// Single-goroutine per the Rollout contract; no mutex.
 type claudeRollout struct {
-	main         *TranscriptFile
-	agentInfo    []AgentFileInfo
-	journalInfo  []WorkflowJournalInfo
-	downloader   AgentDownloader
-	cachedAgents []*TranscriptFile
-	// createdAt is the session's first_seen timestamp, forwarded to ComputeStreaming
-	// for date-aware pricing (e.g. Sonnet 5 introductory rates).
-	createdAt    time.Time
+	main        *TranscriptFile
+	agentInfo   []AgentFileInfo
+	journalInfo []WorkflowJournalInfo
+	downloader  AgentDownloader
 }
 
 // WorkflowJournalInfo describes a workflow run journal file to download.
@@ -53,13 +49,12 @@ func (p *claudeProvider) Parse(ctx context.Context, input ParseInput) (Rollout, 
 		agentInfo:   agentInfo,
 		journalInfo: journalInfo,
 		downloader:  downloader,
-		createdAt:   input.CreatedAt,
 	}, nil
 }
 
 func (p *claudeProvider) ComputeCards(ctx context.Context, rollout Rollout) *ComputeResult {
 	r := rollout.(*claudeRollout)
-	computed, err := ComputeStreaming(ctx, r.main, r.agentProvider(ctx), r.buildWorkflowInputs(ctx), r.createdAt)
+	computed, err := ComputeStreaming(ctx, r.main, r.agentProvider(), r.buildWorkflowInputs(ctx))
 	if err != nil {
 		return &ComputeResult{CardErrors: map[string]string{"compute": err.Error()}}
 	}
@@ -95,9 +90,7 @@ func (p *claudeProvider) SearchText(ctx context.Context, rollout Rollout) string
 	r := rollout.(*claudeRollout)
 	var umb UserMessagesBuilder
 	umb.ProcessFile(r.main)
-	for _, agent := range r.materializeAgents(ctx) {
-		umb.ProcessFile(agent)
-	}
+	r.forEachAgent(ctx, umb.ProcessFile)
 	return umb.Finish()
 }
 
@@ -105,9 +98,7 @@ func (p *claudeProvider) PrepareTranscript(ctx context.Context, rollout Rollout)
 	r := rollout.(*claudeRollout)
 	tb := NewTranscriptBuilder(DefaultFormatConfig())
 	tb.ProcessFile(r.main)
-	for _, agent := range r.materializeAgents(ctx) {
-		tb.ProcessFile(agent)
-	}
+	r.forEachAgent(ctx, tb.ProcessFile)
 	transcript, idMap := tb.Finish()
 	return transcript, idMap, nil
 }
@@ -115,48 +106,25 @@ func (p *claudeProvider) PrepareTranscript(ctx context.Context, rollout Rollout)
 func (p *claudeProvider) ClearMessageIDs() bool { return false }
 func (p *claudeProvider) DisplayName() string   { return "Claude Code" }
 
-// agentProvider returns an AgentProvider that streams agent files and caches
-// each yielded TranscriptFile on r.cachedAgents. After EOF the cache is fully
-// populated; later calls replay from the cache without touching the
-// downloader.
-func (r *claudeRollout) agentProvider(ctx context.Context) AgentProvider {
-	if r.cachedAgents != nil {
-		idx := 0
-		return func(_ context.Context) (*TranscriptFile, error) {
-			if idx >= len(r.cachedAgents) {
-				return nil, io.EOF
-			}
-			tf := r.cachedAgents[idx]
-			idx++
-			return tf, nil
-		}
-	}
-	base := NewAgentProvider(r.agentInfo, r.downloader, storage.MaxAgentFiles)
-	collected := make([]*TranscriptFile, 0, len(r.agentInfo))
-	return func(ctx context.Context) (*TranscriptFile, error) {
-		tf, err := base(ctx)
-		if err != nil {
-			if err == io.EOF {
-				r.cachedAgents = collected
-			}
-			return tf, err
-		}
-		collected = append(collected, tf)
-		return tf, nil
-	}
+// agentProvider returns a fresh AgentProvider that streams this rollout's
+// agent files (capped at storage.MaxAgentFiles) one download+parse at a time.
+func (r *claudeRollout) agentProvider() AgentProvider {
+	return NewAgentProvider(r.agentInfo, r.downloader, storage.MaxAgentFiles)
 }
 
-// materializeAgents drains agentProvider once, returning the full parsed
-// agent set (and priming the cache). NewAgentProvider already logs and
-// skips per-file errors, so the drain always reaches EOF.
-func (r *claudeRollout) materializeAgents(ctx context.Context) []*TranscriptFile {
-	ap := r.agentProvider(ctx)
+// forEachAgent streams every agent file through fn, one at a time; the
+// rollout keeps no reference to a parsed agent after fn returns.
+// NewAgentProvider logs and skips per-file errors, so the loop always reaches
+// EOF.
+func (r *claudeRollout) forEachAgent(ctx context.Context, fn func(*TranscriptFile)) {
+	next := r.agentProvider()
 	for {
-		if _, err := ap(ctx); err != nil {
-			break
+		agent, err := next(ctx)
+		if err != nil {
+			return
 		}
+		fn(agent)
 	}
-	return r.cachedAgents
 }
 
 func downloadClaudeMainAndListAgents(ctx context.Context, input ParseInput) (*TranscriptFile, []AgentFileInfo, []WorkflowJournalInfo, error) {

@@ -33,13 +33,14 @@ export type ProviderId = (typeof PROVIDER_VALUES)[number];
  * undefined since its row labels are self-explanatory for that provider.
  * Added in CF-439 for the Code Activity card's Searches row.
  */
-export interface ProviderCardTooltips {
+interface ProviderCardTooltips {
   codeActivity?: {
     searches?: string;
+    filesRead?: string;
   };
 }
 
-export interface ProviderMetadata {
+interface ProviderMetadata {
   id: ProviderId;
   /** Filter chip / dropdown label (e.g. "Claude Code"). */
   label: string;
@@ -76,7 +77,13 @@ export const PROVIDER_METADATA: Record<ProviderId, ProviderMetadata> = {
     resumeCommand: { idLabel: 'Copy Codex ID', commandHint: 'for codex resume' },
     cardTooltips: {
       codeActivity: {
-        searches: "Codex's web_search_call is not counted as file search",
+        // Both figures come from Codex's own per-command classification
+        // (`parsed_cmd`), which it only started recording in 0.149.1. Older
+        // sessions logged the command line with no indication of its purpose,
+        // so they read 0 rather than a guess. Web searches are excluded from
+        // Searches either way — that's web, not file search (CF-439, m2ky).
+        searches: 'File searches, from Codex 0.149.1 onward; earlier sessions show 0. Web searches are counted as tools, not file searches.',
+        filesRead: 'From Codex 0.149.1 onward; earlier sessions did not record what a command was doing, so they show 0.',
       },
     },
   },
@@ -124,24 +131,6 @@ function isProviderId(value: string): value is ProviderId {
 // display form that may slip through unnormalised on the wire.
 function normalizeProvider(value: string): string {
   return value.toLowerCase().replace(/\s+/g, '-');
-}
-
-/**
- * Mirrors the spirit of backend `models.LegacyAliases`: returns true when
- * `value` is a non-canonical spelling whose normalized form is the
- * canonical `claude-code` id. The classic case is the legacy DB display
- * form `'Claude Code'`.
- *
- * Functionally redundant with `normalizeProvider(value) === 'claude-code' &&
- * value !== 'claude-code'` — promoted to its own export (CF-366) so the
- * legacy-detection rule has one documented home, in case future callers
- * need to branch on "did we just rescue a legacy row?" without re-deriving
- * the rule. `getProviderMetadataOrFallback` handles the rescue
- * transparently via `normalizeProvider`, so most call sites do not need
- * this helper directly.
- */
-export function isLegacyClaudeCode(value: string): boolean {
-  return normalizeProvider(value) === 'claude-code' && value !== 'claude-code';
 }
 
 /**

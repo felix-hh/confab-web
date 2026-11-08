@@ -1,3 +1,4 @@
+import { useState } from 'react';
 import type { Meta, StoryObj } from '@storybook/react-vite';
 import { MemoryRouter } from 'react-router-dom';
 import type { SessionDetail, AssistantMessage, UserMessage, TranscriptLine } from '@/types';
@@ -5,6 +6,13 @@ import type { SessionAnalytics, GitHubLink } from '@/services/api';
 import type { RawCodexLine } from '@/schemas/codexTranscript';
 import { KeyboardShortcutProvider } from '@/contexts/KeyboardShortcutContext';
 import { makeSessionDetailFixture } from '@/test-fixtures/session';
+import {
+  agentToolUse,
+  asyncAgentResult,
+  syncAgentResult,
+  taskNotificationMessage,
+  subagentAssistantText,
+} from '@/test-fixtures/claudeSubagent';
 import SessionViewer from './SessionViewer';
 import { buildCodexAnalyticsFixture } from './codexAnalyticsFixture';
 
@@ -39,6 +47,22 @@ const mockSession: SessionDetail = makeSessionDetailFixture('claude-code', {
   is_owner: true,
   owner_email: 'developer@example.com',
 });
+
+/** A session whose `files` also lists an uploaded `agent-<id>.jsonl` per subagent id (jgk8: the All-subagents total). */
+function withAgentFiles(session: SessionDetail, agentIds: string[]): SessionDetail {
+  return {
+    ...session,
+    files: [
+      ...session.files,
+      ...agentIds.map((id) => ({
+        file_name: `agent-${id}.jsonl`,
+        file_type: 'agent',
+        last_synced_line: 3,
+        updated_at: '2025-01-15T12:30:00Z',
+      })),
+    ],
+  };
+}
 
 // Mock transcript messages
 const mockUserMessage: UserMessage = {
@@ -326,6 +350,190 @@ export const WithCustomTitle: Story = {
     initialAnalytics: mockAnalytics,
     initialGithubLinks: mockGithubLinks,
   },
+};
+
+/**
+ * et0r: Claude session that launched subagents. Opens on the Transcript tab;
+ * the subtab strip lists Main + each subagent. Click a card's
+ * "Open transcript →" or a tab to switch threads; the nested helper inside
+ * "Explore the auth middleware" opens from its card or the strip's
+ * "Launched here" (jgk8), and gets no chip of its own.
+ */
+const subagentMainMessages: TranscriptLine[] = [
+  mockUserMessage,
+  agentToolUse({ uuid: 'sa-u1', toolUseId: 'toolu_sa1', description: 'Explore the auth middleware', subagentType: 'Explore', timestamp: '2025-01-15T10:00:10Z' }),
+  asyncAgentResult({ uuid: 'sa-r1', toolUseId: 'toolu_sa1', agentId: 'a1b2c3d4e5f60718', description: 'Explore the auth middleware', timestamp: '2025-01-15T10:00:11Z' }),
+  agentToolUse({ uuid: 'sa-u2', toolUseId: 'toolu_sa2', description: 'Find every caller of resolveRepo', subagentType: 'general-purpose', timestamp: '2025-01-15T10:00:12Z' }),
+  syncAgentResult({ uuid: 'sa-r2', toolUseId: 'toolu_sa2', agentId: 'b2c3d4e5f6071829', timestamp: '2025-01-15T10:01:30Z' }),
+  agentToolUse({ uuid: 'sa-u3', toolUseId: 'toolu_sa3', description: 'Simplify the recap prompt', timestamp: '2025-01-15T10:01:40Z' }),
+  syncAgentResult({ uuid: 'sa-r3', toolUseId: 'toolu_sa3', agentId: 'd4e5f60718293041', isError: true, text: 'Agent failed: tool budget exhausted.', timestamp: '2025-01-15T10:02:10Z' }),
+  agentToolUse({ uuid: 'sa-u4', toolUseId: 'toolu_sa4', description: 'Run the flaky shard again', timestamp: '2025-01-15T10:02:20Z' }),
+  asyncAgentResult({ uuid: 'sa-r4', toolUseId: 'toolu_sa4', agentId: 'e5f6071829304152', description: 'Run the flaky shard again', timestamp: '2025-01-15T10:02:21Z' }),
+  taskNotificationMessage('sa-n1', { taskId: 'a1b2c3d4e5f60718', toolUseId: 'toolu_sa1', summary: 'Agent "Explore the auth middleware" finished' }, '2025-01-15T10:03:00Z'),
+  taskNotificationMessage('sa-n2', { taskId: 'e5f6071829304152', toolUseId: 'toolu_sa4', status: 'killed', summary: 'Agent "Run the flaky shard again" was stopped' }, '2025-01-15T10:03:30Z'),
+  agentToolUse({ uuid: 'sa-u5', toolUseId: 'toolu_sa5', description: 'Write integration tests for sharing', subagentType: 'general-purpose', timestamp: '2025-01-15T10:04:00Z' }),
+  asyncAgentResult({ uuid: 'sa-r5', toolUseId: 'toolu_sa5', agentId: 'f607182930415263', description: 'Write integration tests for sharing', timestamp: '2025-01-15T10:04:01Z' }),
+];
+
+/**
+ * we3k: 12 subagents with mixed statuses, so the strip overflows (edge fades +
+ * step buttons) and All subagents is useful.
+ */
+const MANY_SUBAGENT_LABELS = [
+  'Review the migration ordering',
+  'Find every caller of resolveRepo',
+  'Write integration tests for sharing',
+  'Explore the auth middleware',
+  'Simplify the recap prompt',
+  'Audit dead exports with knip',
+  'Check pricing table drift',
+  'Draft the release notes',
+  'Trace the polling backoff',
+  'Reproduce the Codex title bug',
+  'Port the docs sidebar',
+  'Verify dark theme tokens',
+];
+const NOTIFIED_STATUSES = ['completed', undefined, 'failed', 'completed', 'killed', undefined];
+const manySubagentMessages: TranscriptLine[] = MANY_SUBAGENT_LABELS.flatMap((description, i) => {
+  const agentId = `9a${String(i).padStart(2, '0')}c3d4e5f60718`;
+  const toolUseId = `toolu_many_${i}`;
+  const status = NOTIFIED_STATUSES[i % NOTIFIED_STATUSES.length];
+  const minute = String(10 + i).padStart(2, '0');
+  return [
+    agentToolUse({ uuid: `many-u${i}`, toolUseId, description, subagentType: 'claude', timestamp: `2025-01-15T10:${minute}:00Z` }),
+    asyncAgentResult({ uuid: `many-r${i}`, toolUseId, agentId, description, timestamp: `2025-01-15T10:${minute}:01Z` }),
+    ...(status
+      ? [taskNotificationMessage(`many-n${i}`, { taskId: agentId, toolUseId, status, summary: `Agent "${description}" ${status}` }, `2025-01-15T10:${minute}:30Z`)]
+      : []),
+  ];
+});
+
+export const WithSubagents: Story = {
+  args: {
+    // Five agents launched from Main plus the nested "Read session store".
+    session: withAgentFiles(mockSession, [
+      'a1b2c3d4e5f60718',
+      'b2c3d4e5f6071829',
+      'd4e5f60718293041',
+      'e5f6071829304152',
+      'f607182930415263',
+      'c3d4e5f607182930',
+    ]),
+    isOwner: true,
+    isShared: false,
+    activeTab: 'transcript',
+    onTabChange: () => {},
+    initialMessages: subagentMainMessages,
+    initialThreadMessages: {
+      a1b2c3d4e5f60718: [
+        subagentAssistantText('sa-a1', 'a1b2c3d4e5f60718', 'Reading `internal/auth/middleware.go` first.', '2025-01-15T10:00:20Z'),
+        agentToolUse({ uuid: 'sa-a2', toolUseId: 'toolu_nested', description: 'Read session store', agentId: 'a1b2c3d4e5f60718', timestamp: '2025-01-15T10:00:30Z' }),
+        asyncAgentResult({ uuid: 'sa-a3', toolUseId: 'toolu_nested', agentId: 'c3d4e5f607182930', description: 'Read session store', timestamp: '2025-01-15T10:00:31Z' }),
+      ],
+      b2c3d4e5f6071829: [
+        subagentAssistantText('sa-b1', 'b2c3d4e5f6071829', 'Found 4 call sites in backend/internal/db.', '2025-01-15T10:01:00Z'),
+      ],
+      c3d4e5f607182930: [
+        subagentAssistantText('sa-c1', 'c3d4e5f607182930', 'The session store lives in internal/db/dbauth.', '2025-01-15T10:00:40Z'),
+      ],
+    },
+    initialAnalytics: mockAnalytics,
+    initialGithubLinks: mockGithubLinks,
+  },
+};
+
+export const WithManySubagents: Story = {
+  args: {
+    session: mockSession,
+    isOwner: true,
+    isShared: false,
+    activeTab: 'transcript',
+    onTabChange: () => {},
+    initialMessages: [mockUserMessage, ...manySubagentMessages],
+    initialAnalytics: mockAnalytics,
+    initialGithubLinks: mockGithubLinks,
+  },
+};
+
+/**
+ * jgk8: nested subagents (depth ≥ 2). Main launches an implementer in the
+ * background; it launches six background judges (`async_launched`), and the
+ * first judge launches a helper (depth 3). `session.files` lists every agent
+ * file, so All subagents counts 9 and notes the 7 launched by subagents.
+ * Open the implementer, then use the strip's "Launched here", the depth-2
+ * row's sibling dropdowns and the judge's own "Launched here".
+ */
+const IMPL_ID = 'a05d3d18c4e2b7f1';
+const JUDGE_IDS = ['a7437088c9e3342e', 'af22b3c603bbfa45', 'ac2e410dcee9aeca', 'a19b3e8c27d40f6a', 'ab70c2d9e5f81346', 'a704e85fe42a11cb'];
+const JUDGE_LABELS = ['Judge arrays r1', 'Judge arrays r2', 'Judge async-event-loops r1', 'Judge b-trees r1', 'Judge b-trees r2', 'Simplify 0e6y Go changes'];
+const HELPER_ID = 'a3e1f07b9c2d4856';
+
+const nestedMainMessages: TranscriptLine[] = [
+  mockUserMessage,
+  agentToolUse({ uuid: 'nm-u1', toolUseId: 'toolu_impl', description: 'Implement 0e6y verification step', subagentType: 'general-purpose', timestamp: '2025-01-15T10:00:10Z' }),
+  asyncAgentResult({ uuid: 'nm-r1', toolUseId: 'toolu_impl', agentId: IMPL_ID, description: 'Implement 0e6y verification step', timestamp: '2025-01-15T10:00:11Z' }),
+  agentToolUse({ uuid: 'nm-u2', toolUseId: 'toolu_explore', description: 'Explore the eval harness', subagentType: 'Explore', timestamp: '2025-01-15T10:00:12Z' }),
+  syncAgentResult({ uuid: 'nm-r2', toolUseId: 'toolu_explore', agentId: 'b17c9e20d4a3f586', timestamp: '2025-01-15T10:01:30Z' }),
+];
+
+const implMessages: TranscriptLine[] = [
+  subagentAssistantText('im-0', IMPL_ID, 'Running the blind judges for each kata.', '2025-01-15T10:00:20Z'),
+  ...JUDGE_LABELS.flatMap((description, i) => [
+    agentToolUse({ uuid: `im-u${i}`, toolUseId: `toolu_judge_${i}`, description, subagentType: 'general-purpose', agentId: IMPL_ID, timestamp: `2025-01-15T10:0${1 + Math.floor(i / 3)}:${String(10 + i).padStart(2, '0')}Z` }),
+    asyncAgentResult({ uuid: `im-r${i}`, toolUseId: `toolu_judge_${i}`, agentId: JUDGE_IDS[i]!, description, timestamp: `2025-01-15T10:0${1 + Math.floor(i / 3)}:${String(11 + i).padStart(2, '0')}Z` }),
+  ]),
+  taskNotificationMessage('im-n0', { taskId: JUDGE_IDS[0]!, toolUseId: 'toolu_judge_0', summary: 'Agent "Judge arrays r1" finished' }, '2025-01-15T10:05:00Z'),
+  taskNotificationMessage('im-n2', { taskId: JUDGE_IDS[2]!, toolUseId: 'toolu_judge_2', status: 'failed', summary: 'Agent "Judge async-event-loops r1" failed' }, '2025-01-15T10:05:30Z'),
+];
+
+const judgeMessages: TranscriptLine[] = [
+  subagentAssistantText('jm-0', JUDGE_IDS[0]!, 'Scoring the arrays kata blind.', '2025-01-15T10:01:30Z'),
+  agentToolUse({ uuid: 'jm-u1', toolUseId: 'toolu_helper', description: 'Re-run the flaky arrays judge', agentId: JUDGE_IDS[0]!, timestamp: '2025-01-15T10:02:00Z' }),
+  asyncAgentResult({ uuid: 'jm-r1', toolUseId: 'toolu_helper', agentId: HELPER_ID, description: 'Re-run the flaky arrays judge', timestamp: '2025-01-15T10:02:01Z' }),
+];
+
+const nestedThreadMessages: Record<string, TranscriptLine[]> = {
+  [IMPL_ID]: implMessages,
+  [JUDGE_IDS[0]!]: judgeMessages,
+  [HELPER_ID]: [subagentAssistantText('hm-0', HELPER_ID, 'Re-running with a fresh worktree.', '2025-01-15T10:02:10Z')],
+  ...Object.fromEntries(
+    JUDGE_IDS.slice(1).map((id, i) => [id, [subagentAssistantText(`jx-${i}`, id, 'Scoring blind.', '2025-01-15T10:02:30Z')]]),
+  ),
+};
+
+const nestedSession = withAgentFiles(mockSession, [IMPL_ID, 'b17c9e20d4a3f586', ...JUDGE_IDS, HELPER_ID]);
+
+export const WithNestedSubagents: Story = {
+  args: {
+    session: nestedSession,
+    isOwner: true,
+    isShared: false,
+    activeTab: 'transcript',
+    onTabChange: () => {},
+    initialMessages: nestedMainMessages,
+    initialThreadMessages: nestedThreadMessages,
+    initialAnalytics: mockAnalytics,
+    initialGithubLinks: mockGithubLinks,
+  },
+};
+
+function ControlledThreadViewer(props: React.ComponentProps<typeof SessionViewer> & { initialThreadId: string }) {
+  const { initialThreadId, ...rest } = props;
+  const [nav, setNav] = useState<{ threadId: string | null; targetId?: string }>({ threadId: initialThreadId });
+  return (
+    <SessionViewer
+      {...rest}
+      activeThreadId={nav.threadId}
+      targetId={nav.targetId}
+      onThreadChange={(threadId, targetId) => setNav({ threadId, targetId })}
+    />
+  );
+}
+
+/** The same session opened on the implementer: the strip shows "Launched here (6)"; pick a judge for the depth-2 row. */
+export const NestedImplementerOpen: Story = {
+  args: WithNestedSubagents.args,
+  render: (args) => <ControlledThreadViewer {...args} initialThreadId={IMPL_ID} />,
 };
 
 /**

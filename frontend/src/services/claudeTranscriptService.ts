@@ -23,6 +23,28 @@ import { reportTranscriptErrors } from './transcriptErrorReporting';
 // ({agentColor}), `custom-title` ({customTitle}). Left unhandled they fall to the
 // UnknownMessageSchema catch-all and render as spurious "Unknown" cards (hundreds
 // per session). Shapes cross-checked against the open-source claude-code-log parser.
+//
+// k6c3: Claude Code bookkeeping rows we also skip — `atis-latch` ({atis, sessionId};
+// `atis` is an opaque server-side experiment-assignment token, re-written before
+// nearly every turn), `file-history-delta` (incremental form of
+// `file-history-snapshot`), `cost-state` (running totalCostUSD + per-model usage),
+// and `bridge-session` (Remote Control session binding).
+//
+// q8ah: Claude Code 2.1.300+ writes an API-request ledger that can rebuild each
+// model request exactly — `api-request` (request params, base request id, tail of
+// blob hashes; written just before each model call), `api-request-blob`
+// (content-addressed copy of message content; its `message.role` is not a turn),
+// and `api-request-shape` (system prompt and tool schemas). Other bookkeeping rows
+// skipped alongside: `artifact-autoreact-ledger` and `artifact-comment-monitor`
+// (per-artifact watch state), `frame-link` (artifact frame binding),
+// `agent-setting` ({agentSetting}, sibling of `agent-name`), and `continued-in`
+// ({continuedInSessionId}).
+//
+// 7ybs: Claude Code 2.1.317 bookkeeping rows we also skip — `session-owner`
+// ({accountUuid, organizationUuid}; the account/org that owns the session),
+// `tools-used` ({tools[]}; running list of tool names), and `fork-context-ref`
+// ({agentId, parentSessionId, parentLastUuid, contextLength}; subagent files only,
+// links a forked subagent to its parent context).
 const SKIPPED_MESSAGE_TYPES = new Set([
   'progress',
   'permission-mode',
@@ -32,6 +54,21 @@ const SKIPPED_MESSAGE_TYPES = new Set([
   'mode',
   'agent-color',
   'custom-title',
+  'atis-latch',
+  'file-history-delta',
+  'cost-state',
+  'bridge-session',
+  'api-request',
+  'api-request-blob',
+  'api-request-shape',
+  'artifact-autoreact-ledger',
+  'artifact-comment-monitor',
+  'agent-setting',
+  'frame-link',
+  'continued-in',
+  'session-owner',
+  'tools-used',
+  'fork-context-ref',
 ]);
 
 // Track which sessions have already had errors reported (dedup across re-parses)
@@ -56,7 +93,6 @@ export function _resetReportedClaudeSessions(): void {
 interface ParsedTranscript {
   sessionId: string;
   messages: TranscriptLine[];
-  agents: AgentNode[];
   /** Validation errors encountered while parsing (empty if all lines valid) */
   validationErrors: TranscriptValidationError[];
   /** Total number of non-empty lines in the file (for line_offset tracking) */
@@ -64,28 +100,10 @@ interface ParsedTranscript {
   metadata: {
     version: string;
     messageCount: number;
-    agentCount: number;
     firstTimestamp?: string;
     lastTimestamp?: string;
     /** Number of lines that failed validation */
     parseErrorCount: number;
-  };
-}
-
-/**
- * Agent node for hierarchical transcript display
- */
-interface AgentNode {
-  agentId: string;
-  transcript: TranscriptLine[];
-  parentToolUseId: string;
-  parentMessageId: string;
-  children: AgentNode[];
-  metadata: {
-    totalDurationMs?: number;
-    totalTokens?: number;
-    totalToolUseCount?: number;
-    status?: string; // 'completed' | 'interrupted' | 'error' - use string for forward compat
   };
 }
 
@@ -248,13 +266,11 @@ export async function fetchParsedClaudeTranscript(
   return {
     sessionId,
     messages,
-    agents: [], // Will be populated by agent tree builder
     validationErrors: errors,
     totalLines,
     metadata: {
       version: getFirstVersion(messages),
       messageCount: messages.length,
-      agentCount: 0, // Will be updated by agent tree builder
       firstTimestamp: timestamps[0],
       lastTimestamp: timestamps[timestamps.length - 1],
       parseErrorCount: errors.length,

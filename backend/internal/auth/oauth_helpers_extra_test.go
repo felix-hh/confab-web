@@ -225,6 +225,9 @@ func TestWriteDeviceTokenError_FormatAndStatus(t *testing.T) {
 	if ct := rec.Header().Get("Content-Type"); ct != "application/json" {
 		t.Errorf("Content-Type = %q, want application/json", ct)
 	}
+	if cc := rec.Header().Get("Cache-Control"); cc != "no-store" {
+		t.Errorf("Cache-Control = %q, want no-store (RFC 6749 §5.1)", cc)
+	}
 
 	var got DeviceTokenResponse
 	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
@@ -240,7 +243,7 @@ func TestWriteDeviceTokenError_FormatAndStatus(t *testing.T) {
 
 func TestSetOAuthLoginCookies_StateLengthAndUniqueness(t *testing.T) {
 	seen := map[string]bool{}
-	for i := 0; i < 4; i++ {
+	for i := range 4 {
 		rec := httptest.NewRecorder()
 		req := httptest.NewRequest("GET", "/login", nil)
 		state, _, _, _, err := setOAuthLoginCookies(rec, req)

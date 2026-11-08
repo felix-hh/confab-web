@@ -53,7 +53,7 @@ class APIValidationError extends Error { endpoint: string; zodError: z.ZodError 
 Handles the full lifecycle of transcript data:
 
 1. **Fetching**: `fetchTranscriptContent()` retrieves JSONL via `syncFilesAPI.getContent()`
-2. **Parsing**: `parseClaudeJSONL()` splits on newlines, validates each line with Zod, and pre-filters metadata-only records listed in `SKIPPED_MESSAGE_TYPES` (currently `progress`, `permission-mode`, `ai-title`, `last-prompt`, `agent-name`, `mode`, `agent-color`, `custom-title`). `attachment` rows are no longer pre-skipped — they parse via `AttachmentMessageSchema` and the categorizer hides noisy subtypes (CF-346)
+2. **Parsing**: `parseClaudeJSONL()` splits on newlines, validates each line with Zod, and pre-filters metadata-only records listed in `SKIPPED_MESSAGE_TYPES` (currently `progress`, `permission-mode`, `ai-title`, `last-prompt`, `agent-name`, `mode`, `agent-color`, `custom-title`, `atis-latch`, `file-history-delta`, `cost-state`, `bridge-session`, `api-request`, `api-request-blob`, `api-request-shape`, `artifact-autoreact-ledger`, `artifact-comment-monitor`, `agent-setting`, `frame-link`, `continued-in`, `session-owner`, `tools-used`, `fork-context-ref`). `attachment` rows are no longer pre-skipped — they parse via `AttachmentMessageSchema` and the categorizer hides noisy subtypes (CF-346)
 3. **Caching**: In-memory cache keyed by `sessionId-fileName`, with `skipCache` option for fresh loads
 4. **Incremental updates**: `fetchNewClaudeTranscriptMessages()` fetches only lines after a given offset
 5. **Error reporting**: Validation errors are reported to `/api/v1/client-errors` (fire-and-forget, deduplicated per session)
@@ -80,9 +80,32 @@ without re-fetching:
    `CodexRenderItem[]` for the timeline. Responsibilities:
    - Drop noise: `session_meta`, `turn_context`,
      `event_msg.task_started`, `event_msg.user_message`,
-     `event_msg.agent_message`, `response_item.message[role=developer]`.
+     `event_msg.agent_message`, `response_item.message[role=developer]`,
+     `event_msg.web_search_end`, `event_msg.context_compacted` (CF-368),
+     `event_msg.item_completed` (every item subtype — the `AgentMessage` case
+     mirrors the canonical `response_item.message` emitted moments later; no
+     other subtype has a distinct row), the top-level `token_usage_record`
+     (aggregate telemetry; usage attribution stays solely on
+     `event_msg.token_count`, below — pnkh), and the top-level `world_state`
+     (periodic environment/instructions/skills snapshot; no analyzer or UI
+     consumes it — zgd6).
      (`session_meta` and `turn_context` are dropped from the render stream
      but their `payload.model` is plucked first — see below.)
+   - **px58 — 9 more recognized-but-silent `event_msg` types**, whitelisted
+     per Codex's own `should_persist_event_msg` rollout policy so they no
+     longer fall through to a misleading "Unrecognized line"
+     `CodexUnknownItem`: `thread_settings_applied` (config snapshot, not
+     conversation content — the originally reported bug),
+     `thread_goal_updated` / `thread_rolled_back` (internal thread
+     bookkeeping), `agent_reasoning` / `agent_reasoning_raw_content`
+     (legacy-history-mode mirrors of `response_item.reasoning`),
+     `sub_agent_activity` (subagent lifecycle telemetry; the parent-side
+     `spawn_agent`/`wait_agent` function_calls remain the analytics source),
+     `entered_review_mode` / `exited_review_mode` (review-mode markers, no
+     dedicated divider), and `image_generation_end` (its
+     `response_item.image_generation_call` sibling is itself unhandled today,
+     so there's no tool-call draft to enrich — real rendering is a separate
+     follow-up).
    - **CF-362 — `event_msg.token_count`**: never emits a render item, but
      walks `items` backwards to find the most-recent assistant item whose
      `usage` is still undefined and attaches `info.last_token_usage` to it
@@ -153,6 +176,7 @@ Key exports:
 - `extractClaudeTextContent(content)` -- Plain text extraction for search indexing and clipboard
 - `extractClaudeMessageText(message)` -- CF-359 — bridges a `TranscriptLine` to the generic `useTranscriptSearch` hook (composes `parseClaudeMessage` + `extractClaudeTextContent`). Stable module reference so passing it as an effect-dependency doesn't churn the search index
 - `getRoleLabel(role, isToolResult)` -- Display label for message role
+- `stringifyUnknownClaudeMessage(message)` -- btxt — 2-space-indented JSON for an unrecognized line, with a `String(value)` fallback if serialization throws. Used by `parseClaudeMessage` (the unknown branch embeds the raw payload after the `Unknown message type: …` line so it is searchable) and by `ClaudeTimelineMessage`'s raw-JSON view. Local twin of Codex's `stringifyForDisplay` (`components/transcript/codex/codexFormat.ts`)
 
 ## How to Extend
 

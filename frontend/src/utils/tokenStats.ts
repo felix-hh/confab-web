@@ -23,7 +23,9 @@ import { PROVIDER_VALUES } from './providers';
  *     reasoning count is preserved separately on the assistant render
  *     item (`reasoningTokens`) for the cost-tooltip sub-line.
  *   - `cacheWrite`: 5-minute cache-creation tokens. Anthropic charges 1.25x
- *     input; OpenAI charges 0 (set to 0 by the Codex normalizer).
+ *     input, as do OpenAI's 5.6 and 6 families; the Codex normalizer still
+ *     sets this to 0 because the rollout wire carries no cache-write count
+ *     (md0z) — the rate exists, the token count does not.
  *   - `cacheWrite1h`: 1-hour cache-creation tokens (Anthropic charges 2x input).
  *     Split out from `cacheWrite` by the Claude normalizer from the wire
  *     `cache_creation` object; 0 for legacy lines and non-Claude providers (rd9v).
@@ -72,7 +74,11 @@ const ZERO_PRICING: ModelPricing = { input: 0, output: 0, cacheWrite: 0, cacheWr
 export const WEB_SEARCH_COST_PER_REQUEST = 0.01;
 
 // Fast mode multiplier applied by the Claude adapter when usage.speed === 'fast'.
-export const FAST_MODE_MULTIPLIER = 6;
+// Anthropic publishes fast mode at a flat 2x the standard rate on every model
+// that offers it: $10/$50 against $5/$25 (Opus 5, Opus 4.8) and $8/$40 against
+// $4/$20 (Opus 5.5).
+// Mirrors the backend's fastModeMultiplier (analytics/pricing.go).
+export const FAST_MODE_MULTIPLIER = 2;
 
 // OpenAI appends pinned-snapshot suffixes like "-2026-05-01" to model names;
 // the Codex branch of getModelFamily strips them.
@@ -104,28 +110,18 @@ export function getModelFamily(provider: ProviderId, modelName: string): string 
   return match ? `${match[1]}-${match[2]}` : name;
 }
 
-// sonnet5Sep1 is the boundary between Sonnet 5 introductory and standard pricing.
-// Sessions whose first_seen is before this instant use the "sonnet-5-intro" rates
-// ($2 input, $10 output); sessions on or after use the "sonnet-5" standard rates
-// ($3 input, $15 output). The introductory period runs through Aug 31, 2026.
-const SONNET5_SEP1 = new Date('2026-09-01T00:00:00Z');
-
-function getPricing(provider: ProviderId, modelName: string, sessionAt?: Date): ModelPricing {
+// Pricing is a pure function of provider + model name: rates are flat per family
+// and never vary by session date. Date-aware routing was removed along with the
+// Sonnet 5 introductory tier (khjx) — a scheduled increase that was cancelled
+// after we had already encoded it, overcharging every Sonnet 5 session by 50%.
+// Encode a price change when it takes effect, never ahead of time.
+function getPricing(provider: ProviderId, modelName: string): ModelPricing {
   // `getModelFamily` performs the unknown-provider check.
   const family = getModelFamily(provider, modelName);
 
-  // Sonnet 5 date-aware routing: sessions starting before 2026-09-01 use the
-  // introductory rates stored under "sonnet-5-intro"; on or after that date they
-  // use the standard "sonnet-5" rates. When sessionAt is omitted, new Date() is
-  // used — correct for newly-computed sessions displayed at their session time.
-  const effectiveFamily =
-    family === 'sonnet-5' && (sessionAt ?? new Date()) < SONNET5_SEP1
-      ? 'sonnet-5-intro'
-      : family;
-
-  const pricing = activePricing[provider]?.[effectiveFamily];
+  const pricing = activePricing[provider]?.[family];
   if (!pricing) {
-    console.warn(`Unknown model for pricing: ${modelName} (provider: ${provider}, family: ${effectiveFamily})`);
+    console.warn(`Unknown model for pricing: ${modelName} (provider: ${provider}, family: ${family})`);
     return ZERO_PRICING;
   }
   return pricing;
@@ -136,19 +132,9 @@ function getPricing(provider: ProviderId, modelName: string, sessionAt?: Date): 
  * those are Claude-specific and live on the provider adapter.
  *
  * Unknown provider throws; unknown model warns and returns 0.
- *
- * `sessionAt` is the session's `first_seen` date. When supplied, it is
- * forwarded to `getPricing` for date-aware routing (e.g. Sonnet 5 intro
- * rates through Aug 31, 2026). When omitted, `new Date()` is used — correct
- * for newly-computed sessions where `sessionAt ≈ now`.
  */
-export function calculateCost(
-  provider: ProviderId,
-  model: string,
-  usage: TokenUsage,
-  sessionAt?: Date,
-): number {
-  const pricing = getPricing(provider, model, sessionAt);
+export function calculateCost(provider: ProviderId, model: string, usage: TokenUsage): number {
+  const pricing = getPricing(provider, model);
   // 1h cache writes fall back to the 5m rate when cacheWrite1h is missing/0
   // (e.g. a stale remote pricing doc) so they never bill $0 (rd9v).
   const effective1hRate = pricing.cacheWrite1h || pricing.cacheWrite;

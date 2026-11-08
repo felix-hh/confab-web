@@ -40,7 +40,6 @@ func (p *opencodeProvider) Parse(ctx context.Context, input ParseInput) (Rollout
 		agentFileInfo:    agentFileInfo,
 		downloader:       downloader,
 		validationErrors: mainErrors,
-		createdAt:        input.CreatedAt,
 	}, nil
 }
 
@@ -50,7 +49,7 @@ func (p *opencodeProvider) ComputeCards(ctx context.Context, rollout Rollout) *C
 		return &ComputeResult{}
 	}
 	rollouts := r.materialize(ctx)
-	result := computeFromOpenCodeRolloutAt(ctx, rollouts, r.createdAt)
+	result := ComputeFromOpenCodeRollout(ctx, rollouts)
 	result.ValidationErrorCount = len(r.validationErrors)
 	return result
 }
@@ -199,14 +198,14 @@ func parseOpenCodeJSONL(ctx context.Context, raw []byte, fileName string) ([]*Op
 	var messages []*OpenCodeMessage
 	var lineErrors []LineValidationError
 	lineNum := 0
-	for _, line := range bytes.Split(raw, []byte("\n")) {
+	for line := range bytes.SplitSeq(raw, []byte("\n")) {
 		line = bytes.TrimSpace(line)
 		if len(line) == 0 {
 			continue
 		}
 		lineNum++
 
-		var rawMap map[string]interface{}
+		var rawMap map[string]any
 		if err := json.Unmarshal(line, &rawMap); err != nil {
 			lineErrors = append(lineErrors, LineValidationError{
 				Line:    lineNum,
@@ -221,7 +220,7 @@ func parseOpenCodeJSONL(ctx context.Context, raw []byte, fileName string) ([]*Op
 
 		if schemaErrors := ValidateOpenCodeLine(rawMap); len(schemaErrors) > 0 {
 			var msgType string
-			if info, ok := rawMap["info"].(map[string]interface{}); ok {
+			if info, ok := rawMap["info"].(map[string]any); ok {
 				msgType, _ = info["role"].(string)
 			}
 			lineErrors = append(lineErrors, LineValidationError{

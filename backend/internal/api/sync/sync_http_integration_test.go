@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/ConfabulousDev/confab-web/internal/api"
 	"github.com/ConfabulousDev/confab-web/internal/api/apitest"
@@ -65,7 +66,7 @@ func TestSyncInit_HTTP_Integration(t *testing.T) {
 		reqBody := api.SyncInitRequest{
 			ExternalID:     "new-session-123",
 			TranscriptPath: "/home/user/project/transcript.jsonl",
-			CWD:            "/home/user/project",
+			Metadata:       &api.SyncInitMetadata{CWD: "/home/user/project"},
 		}
 
 		resp, err := client.Post("/api/v1/sync/init", reqBody)
@@ -112,7 +113,7 @@ func TestSyncInit_HTTP_Integration(t *testing.T) {
 		reqBody := api.SyncInitRequest{
 			ExternalID:     "test-session",
 			TranscriptPath: "/home/user/project/transcript.jsonl",
-			CWD:            "/home/user/project",
+			Metadata:       &api.SyncInitMetadata{CWD: "/home/user/project"},
 		}
 
 		resp, err := client.Post("/api/v1/sync/init", reqBody)
@@ -133,7 +134,7 @@ func TestSyncInit_HTTP_Integration(t *testing.T) {
 		reqBody := api.SyncInitRequest{
 			ExternalID:     "test-session",
 			TranscriptPath: "/home/user/project/transcript.jsonl",
-			CWD:            "/home/user/project",
+			Metadata:       &api.SyncInitMetadata{CWD: "/home/user/project"},
 		}
 
 		resp, err := client.Post("/api/v1/sync/init", reqBody)
@@ -157,7 +158,7 @@ func TestSyncInit_HTTP_Integration(t *testing.T) {
 		reqBody := api.SyncInitRequest{
 			ExternalID:     "", // Missing
 			TranscriptPath: "/home/user/project/transcript.jsonl",
-			CWD:            "/home/user/project",
+			Metadata:       &api.SyncInitMetadata{CWD: "/home/user/project"},
 		}
 
 		resp, err := client.Post("/api/v1/sync/init", reqBody)
@@ -188,7 +189,7 @@ func TestSyncInit_HTTP_Integration(t *testing.T) {
 		reqBody := api.SyncInitRequest{
 			ExternalID:     "test-session",
 			TranscriptPath: "", // Missing
-			CWD:            "/home/user/project",
+			Metadata:       &api.SyncInitMetadata{CWD: "/home/user/project"},
 		}
 
 		resp, err := client.Post("/api/v1/sync/init", reqBody)
@@ -224,7 +225,7 @@ func TestSyncInit_HTTP_Integration(t *testing.T) {
 		reqBody := api.SyncInitRequest{
 			ExternalID:     "existing-session-456",
 			TranscriptPath: "/home/user/project/transcript.jsonl",
-			CWD:            "/home/user/project",
+			Metadata:       &api.SyncInitMetadata{CWD: "/home/user/project"},
 		}
 
 		resp, err := client.Post("/api/v1/sync/init", reqBody)
@@ -269,7 +270,7 @@ func TestSyncInit_HTTP_Integration(t *testing.T) {
 		reqBody := api.SyncInitRequest{
 			ExternalID:     "shared-external-id",
 			TranscriptPath: "/home/user/project/transcript.jsonl",
-			CWD:            "/home/user/project",
+			Metadata:       &api.SyncInitMetadata{CWD: "/home/user/project"},
 		}
 
 		// User1 creates a session
@@ -703,10 +704,10 @@ func TestSyncInit_MetadataNesting_HTTP_Integration(t *testing.T) {
 		client := testutil.NewTestClient(t, ts).WithAPIKey(apiKey.RawToken)
 
 		// Use map to send new nested format
-		reqBody := map[string]interface{}{
+		reqBody := map[string]any{
 			"external_id":     "new-format-session",
 			"transcript_path": "/home/user/project/transcript.jsonl",
-			"metadata": map[string]interface{}{
+			"metadata": map[string]any{
 				"cwd":      "/home/user/new-format-project",
 				"git_info": map[string]string{"branch": "main", "repo_url": "https://github.com/test/repo.git"},
 			},
@@ -763,8 +764,10 @@ func TestSyncInit_MetadataNesting_HTTP_Integration(t *testing.T) {
 		reqBody := api.SyncInitRequest{
 			ExternalID:     "old-format-session",
 			TranscriptPath: "/home/user/project/transcript.jsonl",
-			CWD:            "/home/user/old-format-project",
-			GitInfo:        json.RawMessage(`{"branch":"feature","repo_url":"https://github.com/test/old.git"}`),
+			//lint:ignore SA1019 deliberately exercises the deprecated top-level fields
+			CWD: "/home/user/old-format-project",
+			//lint:ignore SA1019 deliberately exercises the deprecated top-level fields
+			GitInfo: json.RawMessage(`{"branch":"feature","repo_url":"https://github.com/test/old.git"}`),
 		}
 
 		resp, err := client.Post("/api/v1/sync/init", reqBody)
@@ -811,12 +814,12 @@ func TestSyncInit_MetadataNesting_HTTP_Integration(t *testing.T) {
 		client := testutil.NewTestClient(t, ts).WithAPIKey(apiKey.RawToken)
 
 		// Send both top-level AND metadata - metadata should win
-		reqBody := map[string]interface{}{
+		reqBody := map[string]any{
 			"external_id":     "mixed-format-session",
 			"transcript_path": "/home/user/project/transcript.jsonl",
 			"cwd":             "/home/user/top-level-cwd",         // Should be ignored
 			"git_info":        map[string]string{"branch": "old"}, // Should be ignored
-			"metadata": map[string]interface{}{
+			"metadata": map[string]any{
 				"cwd":      "/home/user/metadata-cwd",
 				"git_info": map[string]string{"branch": "new"},
 			},
@@ -866,12 +869,12 @@ func TestSyncInit_MetadataNesting_HTTP_Integration(t *testing.T) {
 		client := testutil.NewTestClient(t, ts).WithAPIKey(apiKey.RawToken)
 
 		// Send top-level with empty metadata - should use top-level
-		reqBody := map[string]interface{}{
+		reqBody := map[string]any{
 			"external_id":     "empty-metadata-session",
 			"transcript_path": "/home/user/project/transcript.jsonl",
 			"cwd":             "/home/user/fallback-cwd",
 			"git_info":        map[string]string{"branch": "fallback"},
-			"metadata":        map[string]interface{}{}, // Empty metadata
+			"metadata":        map[string]any{}, // Empty metadata
 		}
 
 		resp, err := client.Post("/api/v1/sync/init", reqBody)
@@ -918,7 +921,7 @@ func TestSyncInit_MetadataNesting_HTTP_Integration(t *testing.T) {
 		client := testutil.NewTestClient(t, ts).WithAPIKey(apiKey.RawToken)
 
 		// Send top-level with null metadata
-		reqBody := map[string]interface{}{
+		reqBody := map[string]any{
 			"external_id":     "null-metadata-session",
 			"transcript_path": "/home/user/project/transcript.jsonl",
 			"cwd":             "/home/user/null-fallback-cwd",
@@ -964,10 +967,10 @@ func TestSyncInit_MetadataNesting_HTTP_Integration(t *testing.T) {
 		longCWD := "/" + strings.Repeat("a", 9000) // Exceeds 8192 limit
 
 		// Test with metadata.cwd
-		reqBody := map[string]interface{}{
+		reqBody := map[string]any{
 			"external_id":     "cwd-validation-test",
 			"transcript_path": "/home/user/project/transcript.jsonl",
-			"metadata": map[string]interface{}{
+			"metadata": map[string]any{
 				"cwd": longCWD,
 			},
 		}
@@ -1624,13 +1627,13 @@ func TestSyncChunk_Summary_HTTP_Integration(t *testing.T) {
 		client := testutil.NewTestClient(t, ts).WithAPIKey(apiKey.RawToken)
 
 		// Upload chunk with new summary (via metadata)
-		reqBody := map[string]interface{}{
+		reqBody := map[string]any{
 			"session_id": sessionID,
 			"file_name":  "transcript.jsonl",
 			"file_type":  "transcript",
 			"first_line": 1,
 			"lines":      []string{`{"type":"user","message":"Hello"}`},
-			"metadata": map[string]interface{}{
+			"metadata": map[string]any{
 				"summary": "Updated Summary",
 			},
 		}
@@ -1676,13 +1679,13 @@ func TestSyncChunk_Summary_HTTP_Integration(t *testing.T) {
 		client := testutil.NewTestClient(t, ts).WithAPIKey(apiKey.RawToken)
 
 		// Upload chunk with summary B (via metadata)
-		chunkBody := map[string]interface{}{
+		chunkBody := map[string]any{
 			"session_id": sessionID,
 			"file_name":  "transcript.jsonl",
 			"file_type":  "transcript",
 			"first_line": 1,
 			"lines":      []string{`{"type":"user","message":"Hello"}`},
-			"metadata": map[string]interface{}{
+			"metadata": map[string]any{
 				"summary": "Summary B",
 			},
 		}
@@ -1728,13 +1731,13 @@ func TestSyncChunk_Summary_HTTP_Integration(t *testing.T) {
 		client := testutil.NewTestClient(t, ts).WithAPIKey(apiKey.RawToken)
 
 		// Upload chunk with empty summary via metadata (should clear summary)
-		reqBody := map[string]interface{}{
+		reqBody := map[string]any{
 			"session_id": sessionID,
 			"file_name":  "transcript.jsonl",
 			"file_type":  "transcript",
 			"first_line": 1,
 			"lines":      []string{`{"type":"user","message":"Hello"}`},
-			"metadata": map[string]interface{}{
+			"metadata": map[string]any{
 				"summary": "", // Empty string - should clear summary
 			},
 		}
@@ -1837,13 +1840,13 @@ func TestSyncChunk_FirstUserMessage_HTTP_Integration(t *testing.T) {
 		client := testutil.NewTestClient(t, ts).WithAPIKey(apiKey.RawToken)
 
 		// Upload first chunk with first_user_message (via metadata)
-		reqBody := map[string]interface{}{
+		reqBody := map[string]any{
 			"session_id": sessionID,
 			"file_name":  "transcript.jsonl",
 			"file_type":  "transcript",
 			"first_line": 1,
 			"lines":      []string{`{"type":"user","message":"Hello"}`},
-			"metadata": map[string]interface{}{
+			"metadata": map[string]any{
 				"first_user_message": "First message A",
 			},
 		}
@@ -1856,13 +1859,13 @@ func TestSyncChunk_FirstUserMessage_HTTP_Integration(t *testing.T) {
 		testutil.RequireStatus(t, resp1, http.StatusOK)
 
 		// Upload second chunk trying to overwrite first_user_message (via metadata)
-		reqBody2 := map[string]interface{}{
+		reqBody2 := map[string]any{
 			"session_id": sessionID,
 			"file_name":  "transcript.jsonl",
 			"file_type":  "transcript",
 			"first_line": 2,
 			"lines":      []string{`{"type":"assistant","message":"Hi"}`},
-			"metadata": map[string]interface{}{
+			"metadata": map[string]any{
 				"first_user_message": "First message B - should be ignored",
 			},
 		}
@@ -1908,13 +1911,13 @@ func TestSyncChunk_FirstUserMessage_HTTP_Integration(t *testing.T) {
 		client := testutil.NewTestClient(t, ts).WithAPIKey(apiKey.RawToken)
 
 		// Upload chunk trying to overwrite first_user_message (via metadata)
-		chunkBody := map[string]interface{}{
+		chunkBody := map[string]any{
 			"session_id": sessionID,
 			"file_name":  "transcript.jsonl",
 			"file_type":  "transcript",
 			"first_line": 1,
 			"lines":      []string{`{"type":"user","message":"Hello"}`},
-			"metadata": map[string]interface{}{
+			"metadata": map[string]any{
 				"first_user_message": "Message from chunk - should be ignored",
 			},
 		}
@@ -2606,7 +2609,7 @@ func TestSyncInit_RaceCondition_HTTP_Integration(t *testing.T) {
 		start := make(chan struct{})
 
 		// Spawn concurrent requests
-		for i := 0; i < numGoroutines; i++ {
+		for range numGoroutines {
 			go func() {
 				// Wait for start signal
 				<-start
@@ -2616,7 +2619,7 @@ func TestSyncInit_RaceCondition_HTTP_Integration(t *testing.T) {
 				reqBody := api.SyncInitRequest{
 					ExternalID:     externalID,
 					TranscriptPath: "/home/user/project/transcript.jsonl",
-					CWD:            "/home/user/project",
+					Metadata:       &api.SyncInitMetadata{CWD: "/home/user/project"},
 				}
 
 				resp, err := client.Post("/api/v1/sync/init", reqBody)
@@ -2647,7 +2650,7 @@ func TestSyncInit_RaceCondition_HTTP_Integration(t *testing.T) {
 		// Collect results
 		var sessionIDs []string
 		var errors []error
-		for i := 0; i < numGoroutines; i++ {
+		for range numGoroutines {
 			r := <-results
 			if r.err != nil {
 				errors = append(errors, r.err)
@@ -3446,11 +3449,6 @@ func TestSyncChunk_PRLinkExtraction_HTTP_Integration(t *testing.T) {
 // CF-347: Provider-aware sync init and chunk
 // =============================================================================
 
-// strPtr returns a pointer to s. Local helper to keep the provider tests below
-// readable (the api.SyncInitRequest.Provider field is a *string so missing and
-// explicit-empty can be distinguished).
-func strPtr(s string) *string { return &s }
-
 // TestSyncInit_Provider_HTTP_Integration locks the wire-level contract for the
 // optional `provider` field on POST /api/v1/sync/init. Each subtest is a
 // row from the spec table in the CF-347 plan.
@@ -3512,7 +3510,7 @@ func TestSyncInit_Provider_HTTP_Integration(t *testing.T) {
 		reqBody := api.SyncInitRequest{
 			ExternalID:     "empty-provider-ext",
 			TranscriptPath: "/p/transcript.jsonl",
-			Provider:       strPtr(""),
+			Provider:       new(""),
 		}
 		resp, err := client.Post("/api/v1/sync/init", reqBody)
 		if err != nil {
@@ -3540,7 +3538,7 @@ func TestSyncInit_Provider_HTTP_Integration(t *testing.T) {
 		reqBody := api.SyncInitRequest{
 			ExternalID:     "codex-ext",
 			TranscriptPath: "/p/rollout.jsonl",
-			Provider:       strPtr("codex"),
+			Provider:       new("codex"),
 		}
 		resp, err := client.Post("/api/v1/sync/init", reqBody)
 		if err != nil {
@@ -3577,7 +3575,7 @@ func TestSyncInit_Provider_HTTP_Integration(t *testing.T) {
 		reqBody := api.SyncInitRequest{
 			ExternalID:     "gemini-ext",
 			TranscriptPath: "/p.jsonl",
-			Provider:       strPtr("gemini"),
+			Provider:       new("gemini"),
 		}
 		resp, err := client.Post("/api/v1/sync/init", reqBody)
 		if err != nil {
@@ -3605,7 +3603,7 @@ func TestSyncInit_Provider_HTTP_Integration(t *testing.T) {
 		reqBody := api.SyncInitRequest{
 			ExternalID:     "uppercase-ext",
 			TranscriptPath: "/p.jsonl",
-			Provider:       strPtr("Codex"),
+			Provider:       new("Codex"),
 		}
 		resp, err := client.Post("/api/v1/sync/init", reqBody)
 		if err != nil {
@@ -3629,7 +3627,7 @@ func TestSyncInit_Provider_HTTP_Integration(t *testing.T) {
 		cc, err := client.Post("/api/v1/sync/init", api.SyncInitRequest{
 			ExternalID:     shared,
 			TranscriptPath: "/p/cc.jsonl",
-			Provider:       strPtr("claude-code"),
+			Provider:       new("claude-code"),
 		})
 		if err != nil {
 			t.Fatalf("claude-code request: %v", err)
@@ -3642,7 +3640,7 @@ func TestSyncInit_Provider_HTTP_Integration(t *testing.T) {
 		cx, err := client.Post("/api/v1/sync/init", api.SyncInitRequest{
 			ExternalID:     shared,
 			TranscriptPath: "/p/codex.jsonl",
-			Provider:       strPtr("codex"),
+			Provider:       new("codex"),
 		})
 		if err != nil {
 			t.Fatalf("codex request: %v", err)
@@ -4295,6 +4293,57 @@ func TestSyncChunk_CodexRollout_HTTP_Integration(t *testing.T) {
 		testutil.RequireStatus(t, resp, http.StatusBadRequest)
 	})
 
+	// wmet: the self-link check compares parsed UUIDs, so an upper-case parent
+	// spelling of the lower-case thread UUID is the same Postgres UUID and must
+	// be rejected before any codex_rollouts row is written.
+	t.Run("400 on self-link with differently-cased parent_thread_uuid", func(t *testing.T) {
+		env.CleanDB(t)
+
+		user := testutil.CreateTestUser(t, env, "cr-self-case@example.com", "User")
+		apiKey := testutil.CreateTestAPIKeyWithToken(t, env, user.ID, "K")
+		sessionID := testutil.CreateTestSessionWithProvider(t, env, user.ID, "ext-cr-self-case", "codex")
+
+		ts := setupTestServerWithEnv(t, env)
+		client := testutil.NewTestClient(t, ts).WithAPIKey(apiKey.RawToken)
+
+		const threadUUID = "abcdefab-cdef-4abc-8def-abcdefabcdef"
+		resp, err := client.Post("/api/v1/sync/chunk", api.SyncChunkRequest{
+			SessionID: sessionID,
+			FileName:  "x.jsonl",
+			FileType:  "transcript",
+			FirstLine: 1,
+			Lines:     []string{`{"x":1}`},
+			Metadata: &api.SyncChunkMetadata{
+				CodexRollout: &api.SyncCodexRolloutMetadata{
+					ThreadUUID:       threadUUID,
+					ParentThreadUUID: ptr(strings.ToUpper(threadUUID)),
+					RolloutPath:      "/x.jsonl",
+				},
+			},
+		})
+		if err != nil {
+			t.Fatalf("request: %v", err)
+		}
+		defer resp.Body.Close()
+		testutil.RequireStatus(t, resp, http.StatusBadRequest)
+
+		var result map[string]string
+		testutil.ParseJSON(t, resp, &result)
+		if want := "parent_thread_uuid must not equal thread_uuid"; result["error"] != want {
+			t.Errorf("error = %q, want %q", result["error"], want)
+		}
+
+		var count int
+		if err := env.DB.QueryRow(env.Ctx,
+			`SELECT COUNT(*) FROM codex_rollouts WHERE user_id = $1`, user.ID,
+		).Scan(&count); err != nil {
+			t.Fatalf("count: %v", err)
+		}
+		if count != 0 {
+			t.Errorf("codex_rollouts rows after rejected self-link = %d, want 0", count)
+		}
+	})
+
 	t.Run("400 on empty rollout_path", func(t *testing.T) {
 		env.CleanDB(t)
 
@@ -4562,7 +4611,7 @@ func TestSyncCursor_HTTP_Integration(t *testing.T) {
 		reqBody := api.SyncInitRequest{
 			ExternalID:     "cursor-session-1",
 			TranscriptPath: "/home/user/.cursor/projects/p/agent-transcripts/cursor-session-1.jsonl",
-			CWD:            "/home/user/project",
+			Metadata:       &api.SyncInitMetadata{CWD: "/home/user/project"},
 			Provider:       &cursor,
 		}
 
@@ -5387,6 +5436,421 @@ func TestSyncCursor_HTTP_Integration(t *testing.T) {
 		}
 		if lastMessageAt != nil {
 			t.Errorf("last_message_at = %v, want NULL (cursor subagent agent-file upload must not advance root activity)", lastMessageAt)
+		}
+	})
+}
+
+// =============================================================================
+// POST /api/v1/sync/chunk - Codex first_user_message derivation (tgxn)
+//
+// Codex sessions never carry a summary, so list visibility rests entirely on
+// first_user_message. When the CLI omits that metadata field the backend
+// derives it from the chunk's own event_msg lines. Line shapes below are the
+// ones captured from real rollouts (see internal/codex/firstuser_test.go).
+// =============================================================================
+
+// codexModernUserMessageLine builds a >=0.149.1 event_msg → item_completed →
+// UserMessage line carrying text.
+func codexModernUserMessageLine(t *testing.T, text string) string {
+	t.Helper()
+	line, err := json.Marshal(map[string]any{
+		"timestamp": "2026-09-10T21:44:11.768Z",
+		"ordinal":   9,
+		"type":      "event_msg",
+		"payload": map[string]any{
+			"type":      "item_completed",
+			"thread_id": "01a08d46-8735-7c00-b558-f23eb1ce6cbc",
+			"item": map[string]any{
+				"type":    "UserMessage",
+				"id":      "01a08d47-3ef8-75a0-9e73-cb16a9ec747d",
+				"content": []any{map[string]any{"type": "text", "text": text, "text_elements": []any{}}},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshal codex line: %v", err)
+	}
+	return string(line)
+}
+
+// codexOldEraUserMessageLine builds a <=0.130.0 event_msg → user_message line.
+func codexOldEraUserMessageLine(t *testing.T, text string) string {
+	t.Helper()
+	line, err := json.Marshal(map[string]any{
+		"timestamp": "2026-05-18T15:26:28.570Z",
+		"type":      "event_msg",
+		"payload": map[string]any{
+			"type":          "user_message",
+			"message":       text,
+			"images":        []any{},
+			"local_images":  []any{},
+			"text_elements": []any{},
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshal codex line: %v", err)
+	}
+	return string(line)
+}
+
+// codexPreambleLines are the lines that precede the first human prompt in every
+// real rollout: session meta, task_started, and the injected-context
+// response_items the derivation must never read.
+func codexPreambleLines() []string {
+	return []string{
+		`{"timestamp":"2026-09-10T21:44:00.000Z","type":"session_meta","payload":{"id":"01a08d46","cwd":"/home/u/dev/example","cli_version":"0.154.0"}}`,
+		`{"timestamp":"2026-09-10T21:44:10.000Z","type":"event_msg","payload":{"type":"task_started","turn_id":"01a08d47","started_at":1789076650}}`,
+		`{"timestamp":"2026-09-10T21:44:10.500Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"<environment_context>\n  <cwd>/home/u/dev/example</cwd>\n</environment_context>"}]}}`,
+		`{"timestamp":"2026-09-10T21:44:10.900Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"# AGENTS.md instructions for /home/u/dev/example\n\n<INSTRUCTIONS>\nUse pnpm.\n</INSTRUCTIONS>"}]}}`,
+	}
+}
+
+func queryFirstUserMessage(t *testing.T, env *testutil.TestEnvironment, sessionID string) *string {
+	t.Helper()
+	var firstUserMessage *string
+	row := env.DB.QueryRow(env.Ctx, "SELECT first_user_message FROM sessions WHERE id = $1", sessionID)
+	if err := row.Scan(&firstUserMessage); err != nil {
+		t.Fatalf("query first_user_message: %v", err)
+	}
+	return firstUserMessage
+}
+
+func TestSyncChunk_CodexFirstUserMessageDerivation_HTTP_Integration(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping HTTP integration test in short mode")
+	}
+
+	os.Setenv("LOG_FORMAT", "json")
+
+	env := testutil.SetupTestEnvironment(t)
+
+	t.Run("derives first_user_message from a modern rollout chunk when the client omits it", func(t *testing.T) {
+		env.CleanDB(t)
+
+		user := testutil.CreateTestUser(t, env, "codex-modern@example.com", "User")
+		apiKey := testutil.CreateTestAPIKeyWithToken(t, env, user.ID, "K")
+		webToken := testutil.CreateTestWebSessionWithToken(t, env, user.ID)
+		sessionID := testutil.CreateTestSessionWithProvider(t, env, user.ID, "ext-codex-modern", "codex")
+
+		ts := setupTestServerWithEnv(t, env)
+		client := testutil.NewTestClient(t, ts).WithAPIKey(apiKey.RawToken)
+
+		const prompt = "explore this project and review my draft post"
+		lines := append(codexPreambleLines(), codexModernUserMessageLine(t, prompt))
+
+		resp, err := client.Post("/api/v1/sync/chunk", api.SyncChunkRequest{
+			SessionID: sessionID,
+			FileName:  "rollout.jsonl",
+			FileType:  "transcript",
+			FirstLine: 1,
+			Lines:     lines,
+		})
+		if err != nil {
+			t.Fatalf("request: %v", err)
+		}
+		resp.Body.Close()
+		testutil.RequireStatus(t, resp, http.StatusOK)
+
+		got := queryFirstUserMessage(t, env, sessionID)
+		if got == nil || *got != prompt {
+			t.Fatalf("first_user_message = %v, want %q", got, prompt)
+		}
+
+		// The whole point of the derivation: the session becomes listable.
+		listClient := testutil.NewTestClient(t, ts).WithSession(webToken)
+		listResp, err := listClient.Get("/api/v1/sessions")
+		if err != nil {
+			t.Fatalf("list request: %v", err)
+		}
+		defer listResp.Body.Close()
+		testutil.RequireStatus(t, listResp, http.StatusOK)
+
+		var result struct {
+			Sessions []struct {
+				ID               string  `json:"id"`
+				FirstUserMessage *string `json:"first_user_message"`
+			} `json:"sessions"`
+		}
+		testutil.ParseJSON(t, listResp, &result)
+		if len(result.Sessions) != 1 || result.Sessions[0].ID != sessionID {
+			t.Fatalf("expected the derived codex session to be listable, got %+v", result.Sessions)
+		}
+	})
+
+	t.Run("derives first_user_message from an old-era rollout chunk", func(t *testing.T) {
+		env.CleanDB(t)
+
+		user := testutil.CreateTestUser(t, env, "codex-old@example.com", "User")
+		apiKey := testutil.CreateTestAPIKeyWithToken(t, env, user.ID, "K")
+		sessionID := testutil.CreateTestSessionWithProvider(t, env, user.ID, "ext-codex-old", "codex")
+
+		ts := setupTestServerWithEnv(t, env)
+		client := testutil.NewTestClient(t, ts).WithAPIKey(apiKey.RawToken)
+
+		const prompt = "add a retry to the uploader"
+		lines := append(codexPreambleLines(), codexOldEraUserMessageLine(t, prompt))
+
+		resp, err := client.Post("/api/v1/sync/chunk", api.SyncChunkRequest{
+			SessionID: sessionID,
+			FileName:  "rollout.jsonl",
+			FileType:  "transcript",
+			FirstLine: 1,
+			Lines:     lines,
+		})
+		if err != nil {
+			t.Fatalf("request: %v", err)
+		}
+		defer resp.Body.Close()
+		testutil.RequireStatus(t, resp, http.StatusOK)
+
+		got := queryFirstUserMessage(t, env, sessionID)
+		if got == nil || *got != prompt {
+			t.Errorf("first_user_message = %v, want %q", got, prompt)
+		}
+	})
+
+	t.Run("derives the first user message, not a later one", func(t *testing.T) {
+		env.CleanDB(t)
+
+		user := testutil.CreateTestUser(t, env, "codex-first@example.com", "User")
+		apiKey := testutil.CreateTestAPIKeyWithToken(t, env, user.ID, "K")
+		sessionID := testutil.CreateTestSessionWithProvider(t, env, user.ID, "ext-codex-first", "codex")
+
+		ts := setupTestServerWithEnv(t, env)
+		client := testutil.NewTestClient(t, ts).WithAPIKey(apiKey.RawToken)
+
+		const prompt = "the first thing I typed"
+		lines := append(codexPreambleLines(),
+			codexModernUserMessageLine(t, prompt),
+			codexModernUserMessageLine(t, "a follow-up prompt"),
+		)
+
+		resp, err := client.Post("/api/v1/sync/chunk", api.SyncChunkRequest{
+			SessionID: sessionID,
+			FileName:  "rollout.jsonl",
+			FileType:  "transcript",
+			FirstLine: 1,
+			Lines:     lines,
+		})
+		if err != nil {
+			t.Fatalf("request: %v", err)
+		}
+		defer resp.Body.Close()
+		testutil.RequireStatus(t, resp, http.StatusOK)
+
+		got := queryFirstUserMessage(t, env, sessionID)
+		if got == nil || *got != prompt {
+			t.Errorf("first_user_message = %v, want %q", got, prompt)
+		}
+	})
+
+	t.Run("client-supplied first_user_message wins verbatim", func(t *testing.T) {
+		env.CleanDB(t)
+
+		user := testutil.CreateTestUser(t, env, "codex-client-wins@example.com", "User")
+		apiKey := testutil.CreateTestAPIKeyWithToken(t, env, user.ID, "K")
+		sessionID := testutil.CreateTestSessionWithProvider(t, env, user.ID, "ext-codex-client", "codex")
+
+		ts := setupTestServerWithEnv(t, env)
+		client := testutil.NewTestClient(t, ts).WithAPIKey(apiKey.RawToken)
+
+		lines := append(codexPreambleLines(), codexModernUserMessageLine(t, "derived value"))
+
+		resp, err := client.Post("/api/v1/sync/chunk", api.SyncChunkRequest{
+			SessionID: sessionID,
+			FileName:  "rollout.jsonl",
+			FileType:  "transcript",
+			FirstLine: 1,
+			Lines:     lines,
+			Metadata:  &api.SyncChunkMetadata{FirstUserMessage: new("client supplied value")},
+		})
+		if err != nil {
+			t.Fatalf("request: %v", err)
+		}
+		defer resp.Body.Close()
+		testutil.RequireStatus(t, resp, http.StatusOK)
+
+		got := queryFirstUserMessage(t, env, sessionID)
+		if got == nil || *got != "client supplied value" {
+			t.Errorf("first_user_message = %v, want %q", got, "client supplied value")
+		}
+	})
+
+	t.Run("no derivation for chunks after the first", func(t *testing.T) {
+		env.CleanDB(t)
+
+		user := testutil.CreateTestUser(t, env, "codex-latechunk@example.com", "User")
+		apiKey := testutil.CreateTestAPIKeyWithToken(t, env, user.ID, "K")
+		sessionID := testutil.CreateTestSessionWithProvider(t, env, user.ID, "ext-codex-late", "codex")
+
+		ts := setupTestServerWithEnv(t, env)
+		client := testutil.NewTestClient(t, ts).WithAPIKey(apiKey.RawToken)
+
+		// Chunk 1 carries only injected context, so nothing is derivable from it.
+		preamble := codexPreambleLines()
+		resp1, err := client.Post("/api/v1/sync/chunk", api.SyncChunkRequest{
+			SessionID: sessionID,
+			FileName:  "rollout.jsonl",
+			FileType:  "transcript",
+			FirstLine: 1,
+			Lines:     preamble,
+		})
+		if err != nil {
+			t.Fatalf("request: %v", err)
+		}
+		resp1.Body.Close()
+		testutil.RequireStatus(t, resp1, http.StatusOK)
+
+		// Chunk 2 does carry a human prompt, but derivation is first-chunk-only:
+		// self-healing a session whose chunk 1 predates this fix is nbrd's job.
+		resp, err := client.Post("/api/v1/sync/chunk", api.SyncChunkRequest{
+			SessionID: sessionID,
+			FileName:  "rollout.jsonl",
+			FileType:  "transcript",
+			FirstLine: len(preamble) + 1,
+			Lines:     []string{codexModernUserMessageLine(t, "not the first chunk")},
+		})
+		if err != nil {
+			t.Fatalf("request: %v", err)
+		}
+		defer resp.Body.Close()
+		testutil.RequireStatus(t, resp, http.StatusOK)
+
+		if got := queryFirstUserMessage(t, env, sessionID); got != nil {
+			t.Errorf("first_user_message = %q, want NULL for a non-first chunk", *got)
+		}
+	})
+
+	t.Run("underivable chunk leaves the column NULL", func(t *testing.T) {
+		env.CleanDB(t)
+
+		user := testutil.CreateTestUser(t, env, "codex-null@example.com", "User")
+		apiKey := testutil.CreateTestAPIKeyWithToken(t, env, user.ID, "K")
+		sessionID := testutil.CreateTestSessionWithProvider(t, env, user.ID, "ext-codex-null", "codex")
+
+		ts := setupTestServerWithEnv(t, env)
+		client := testutil.NewTestClient(t, ts).WithAPIKey(apiKey.RawToken)
+
+		// Preamble only: injected context response_items and no event_msg user
+		// message. An empty derivation must never become an empty-string title.
+		resp, err := client.Post("/api/v1/sync/chunk", api.SyncChunkRequest{
+			SessionID: sessionID,
+			FileName:  "rollout.jsonl",
+			FileType:  "transcript",
+			FirstLine: 1,
+			Lines:     codexPreambleLines(),
+		})
+		if err != nil {
+			t.Fatalf("request: %v", err)
+		}
+		defer resp.Body.Close()
+		testutil.RequireStatus(t, resp, http.StatusOK)
+
+		if got := queryFirstUserMessage(t, env, sessionID); got != nil {
+			t.Errorf("first_user_message = %q, want NULL", *got)
+		}
+	})
+
+	t.Run("oversized derived value is truncated on a rune boundary, not rejected", func(t *testing.T) {
+		env.CleanDB(t)
+
+		user := testutil.CreateTestUser(t, env, "codex-long@example.com", "User")
+		apiKey := testutil.CreateTestAPIKeyWithToken(t, env, user.ID, "K")
+		sessionID := testutil.CreateTestSessionWithProvider(t, env, user.ID, "ext-codex-long", "codex")
+
+		ts := setupTestServerWithEnv(t, env)
+		client := testutil.NewTestClient(t, ts).WithAPIKey(apiKey.RawToken)
+
+		// 2-byte runes so a naive byte slice would split one mid-rune.
+		longPrompt := strings.Repeat("é", validation.MaxFirstUserMessageLength)
+		lines := append(codexPreambleLines(), codexModernUserMessageLine(t, longPrompt))
+
+		resp, err := client.Post("/api/v1/sync/chunk", api.SyncChunkRequest{
+			SessionID: sessionID,
+			FileName:  "rollout.jsonl",
+			FileType:  "transcript",
+			FirstLine: 1,
+			Lines:     lines,
+		})
+		if err != nil {
+			t.Fatalf("request: %v", err)
+		}
+		defer resp.Body.Close()
+		testutil.RequireStatus(t, resp, http.StatusOK)
+
+		got := queryFirstUserMessage(t, env, sessionID)
+		if got == nil {
+			t.Fatal("first_user_message = NULL, want a truncated value")
+		}
+		if len(*got) > validation.MaxFirstUserMessageLength {
+			t.Errorf("first_user_message is %d bytes, want <= %d", len(*got), validation.MaxFirstUserMessageLength)
+		}
+		if !utf8.ValidString(*got) {
+			t.Error("first_user_message is not valid UTF-8 — truncation split a rune")
+		}
+		if !strings.HasPrefix(longPrompt, *got) {
+			t.Error("first_user_message is not a prefix of the derived value")
+		}
+		// A truncation that threw away nearly everything would defeat the point.
+		if len(*got) < validation.MaxFirstUserMessageLength-4 {
+			t.Errorf("first_user_message is %d bytes, want close to the %d-byte limit",
+				len(*got), validation.MaxFirstUserMessageLength)
+		}
+	})
+
+	t.Run("no derivation for non-codex providers", func(t *testing.T) {
+		env.CleanDB(t)
+
+		user := testutil.CreateTestUser(t, env, "codex-other-provider@example.com", "User")
+		apiKey := testutil.CreateTestAPIKeyWithToken(t, env, user.ID, "K")
+		sessionID := testutil.CreateTestSessionWithProvider(t, env, user.ID, "ext-claude-shaped", string(models.ProviderClaudeCode))
+
+		ts := setupTestServerWithEnv(t, env)
+		client := testutil.NewTestClient(t, ts).WithAPIKey(apiKey.RawToken)
+
+		resp, err := client.Post("/api/v1/sync/chunk", api.SyncChunkRequest{
+			SessionID: sessionID,
+			FileName:  "transcript.jsonl",
+			FileType:  "transcript",
+			FirstLine: 1,
+			Lines:     []string{codexModernUserMessageLine(t, "codex-shaped line on a claude session")},
+		})
+		if err != nil {
+			t.Fatalf("request: %v", err)
+		}
+		defer resp.Body.Close()
+		testutil.RequireStatus(t, resp, http.StatusOK)
+
+		if got := queryFirstUserMessage(t, env, sessionID); got != nil {
+			t.Errorf("first_user_message = %q, want NULL for a non-codex provider", *got)
+		}
+	})
+
+	t.Run("no derivation for non-transcript file types", func(t *testing.T) {
+		env.CleanDB(t)
+
+		user := testutil.CreateTestUser(t, env, "codex-agentfile@example.com", "User")
+		apiKey := testutil.CreateTestAPIKeyWithToken(t, env, user.ID, "K")
+		sessionID := testutil.CreateTestSessionWithProvider(t, env, user.ID, "ext-codex-agent", "codex")
+
+		ts := setupTestServerWithEnv(t, env)
+		client := testutil.NewTestClient(t, ts).WithAPIKey(apiKey.RawToken)
+
+		resp, err := client.Post("/api/v1/sync/chunk", api.SyncChunkRequest{
+			SessionID: sessionID,
+			FileName:  "agent-rollout.jsonl",
+			FileType:  "agent",
+			FirstLine: 1,
+			Lines:     []string{codexModernUserMessageLine(t, "subagent prompt")},
+		})
+		if err != nil {
+			t.Fatalf("request: %v", err)
+		}
+		defer resp.Body.Close()
+		testutil.RequireStatus(t, resp, http.StatusOK)
+
+		if got := queryFirstUserMessage(t, env, sessionID); got != nil {
+			t.Errorf("first_user_message = %q, want NULL for an agent file", *got)
 		}
 	})
 }

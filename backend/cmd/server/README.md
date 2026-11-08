@@ -78,21 +78,20 @@ that still uses the public template defaults, `loadConfig` refuses to start when
 | `SHARE_ALL_SESSIONS_TO_AUTHENTICATED` | `"true"` makes every session visible to all signed-in users. On-prem use. |
 | `ENABLE_SHARE_CREATION` | Logs that share links can be created. |
 | `SHARE_DAILY_QUOTA` | Per-user cap on shares created in a rolling 24h window (default `100`). The share-creation endpoint returns 429 once exceeded; `0` disables the cap. Invalid/negative values fail startup. |
-| `ENABLE_SAAS_FOOTER` / `ENABLE_SAAS_TERMLY` | SaaS-only UI/consent toggles. `ENABLE_SAAS_FOOTER=true` also disables the GitHub-release update check (SaaS users can't self-upgrade). |
+| `ENABLE_SAAS_FOOTER` | SaaS-only UI toggle. `ENABLE_SAAS_FOOTER=true` also disables the GitHub-release update check (SaaS users can't self-upgrade). |
 | `DISABLE_UPDATE_CHECK` | `"true"` suppresses the in-product "Update available" badge by skipping the periodic GitHub release fetch. Useful for air-gapped deployments. |
 | `ENABLE_PPROF` | `"true"` exposes `pprof` on `127.0.0.1:6060` (use `fly proxy 6060:6060`). |
 
 ### Observability
 | Var | Purpose |
 |---|---|
-| `OTEL_SERVICE_NAME` / `OTEL_EXPORTER_OTLP_ENDPOINT` / `OTEL_EXPORTER_OTLP_HEADERS` | OpenTelemetry config (Honeycomb). Tracing is no-op if unset. |
 | `LOG_LEVEL` | `debug` / `info` / `warn` / `error`. Default `info`. |
 
 ## Worker env vars
 
 | Var | Default | Purpose |
 |---|---|---|
-| `WORKER_MAX_SESSIONS` | (required) | Max sessions to scan per cycle for regular cards + smart recap. |
+| `WORKER_MAX_SESSIONS` | (required) | Max sessions to scan per cycle for regular cards, smart recap, and session title recompute (each bucket separately). |
 | `WORKER_MAX_SEARCH_INDEX_SESSIONS` | `200` | Max sessions to scan per cycle for search index. |
 | `WORKER_POLL_INTERVAL` | `30m` | Cycle interval. Garbage/zero/negative values keep the default. |
 | `WORKER_DRY_RUN` | (off) | `"true"` or `"1"` logs intended work without doing it. Case-sensitive. |
@@ -102,8 +101,9 @@ that still uses the public template defaults, `loadConfig` refuses to start when
 ### Smart recap (LLM-backed)
 | Var | Default | Purpose |
 |---|---|---|
-| `SMART_RECAP_ENABLED` | (off) | `"true"` enables. Silently disabled if `ANTHROPIC_API_KEY` or `SMART_RECAP_MODEL` is missing. |
-| `ANTHROPIC_API_KEY` / `SMART_RECAP_MODEL` | (off) | Both required to actually enable. |
+| `SMART_RECAP_ENABLED` | (off) | `"true"` enables. Disabled with a startup warning naming the missing var if the active provider's API key or `SMART_RECAP_MODEL` is missing. |
+| `SMART_RECAP_LLM_PROVIDER` | `anthropic` | `anthropic` or `openai`. Any other value is fatal at startup (even when smart recap is disabled). Resolved by `analytics.ResolveSmartRecapLLMConfig`, shared with the API server. |
+| `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` / `SMART_RECAP_MODEL` | (off) | The active provider's key plus the model are required to actually enable. |
 | `SMART_RECAP_QUOTA_LIMIT` | unlimited | Per-user-per-month cap. `0` = unlimited. Negative or non-integer fails loudly. |
 | `SMART_RECAP_MAX_OUTPUT_TOKENS` | (model default) | Output token cap. |
 | `SMART_RECAP_MAX_TRANSCRIPT_TOKENS` | (model default) | Input transcript token cap. |
@@ -120,11 +120,23 @@ Each prefix supports the same five suffixes. Unset values use the per-bucket def
 | `_MIN_INITIAL_LINES` | int ≥ 0 | Lines required before any first compute. |
 | `_MIN_SESSION_AGE` | duration ≥ 0 | After this age, compute even with few lines. |
 
+## Precompute failure quarantine (6kbe)
+
+Every worker bucket goes through `processSessions`, which tracks each attempt per (session, bucket) in `session_precompute_failures` through the `precomputeFailureTracker` interface (`*analytics.Store` in production):
+
+- Before an attempt: `ClaimAttempt` sets `in_progress_since`.
+- After it: success → `RecordSuccess` (deletes the row, resetting the count); `ErrQuotaExceeded` or a canceled ctx (shutdown) → `ReleaseAttempt` (not counted); any other error → `RecordFailure`.
+- After `analytics.QuarantineAfterAttempts` (5) consecutive failures, the session is quarantined: that bucket's `Find*` query excludes it in SQL, so it no longer fills `LIMIT`. The worker logs one WARN, `session quarantined from precompute`, with `session_id`, `bucket`, `attempts` and `last_error`. There is no backoff before that: one attempt per cycle, about 2.5h at the default 30m poll.
+- Crashes: `runWorker` calls `sweepCrashedAttempts` once before the first cycle, which counts every claim still open as a failed attempt (the previous process died mid-attempt: OOM, panic, hard kill). This stops a session that crashes the worker from being picked first after every Fly restart. It relies on the worker being a **single process** (`fly.toml` runs one `worker` machine); a second concurrent worker would have its in-flight claims counted as crashes.
+- Bookkeeping is best-effort: its writes use a context detached from shutdown with a 5s timeout, and an error is logged and never aborts the cycle. Dry-run writes nothing.
+- Release paths: the admin **Precompute Failures** tab (`/admin/precompute-failures`, per row or **Release all**, both audited), or a successful on-view compute (`GET /sessions/{id}/analytics` releases `regular_cards` and `smart_recap`). `search_index` and `session_title` have no on-view path. There is no time-based expiry.
+- A global outage (S3, DB or LLM down for 2.5h+) can quarantine many sessions at once. Recover with **Release all** once it is fixed.
+
 ## Where to extend
 
 - Adding a new API endpoint: handler in [`internal/api`](../../internal/api); register in `SetupRoutes`; document in [`backend/API.md`](../../API.md).
 - Adding analytics cards: follow `/add-session-card` skill — touches `internal/analytics`, migrations, and the frontend.
-- Adding a new worker bucket: extend `precomputerAPI` and `Worker.runOnce` in `worker.go` (and the fake in tests). Each bucket has its own `Find*` + `process*` adapter onto `processSessions`.
+- Adding a new worker bucket: extend `precomputerAPI` and `Worker.runOnce` in `worker.go` (and the fake in tests). Each bucket has its own `Find*` + `process*` adapter onto `processSessions`, and its own `analytics.Bucket*` constant (add it to `precomputeBuckets`, and the frontend's bucket labels) whose `notQuarantinedClause` goes in the new `Find*` query. Current buckets: 1 regular cards, 2 smart recap, 3 search index, 4 session title recompute (`FindTitleRecomputeSessions` / `RecomputeSessionTitle`, nbrd).
 
 ## Tests
 
